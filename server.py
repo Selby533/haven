@@ -682,8 +682,10 @@ app.include_router(api_router)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[
-        "https://stokvel-cafbf.firebaseapp.com",
+        "https://haven-83b20.web.app",
+        "https://haven-83b20.firebaseapp.com",
         "https://stokvel-cafbf.web.app",
+        "https://stokvel-cafbf.firebaseapp.com",
         "http://localhost:3000",
         "http://localhost:5173",
         "http://localhost:8000",
@@ -694,7 +696,6 @@ app.add_middleware(
     allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"],
     allow_headers=["*"],
 )
-
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
