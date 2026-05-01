@@ -145,7 +145,10 @@ class CreateCommentPayload(BaseModel):
 class SwipePayload(BaseModel):
     swiped_id: str
     direction: str  # 'like' or 'pass'
+    swipe_type: Optional[str] = 'dating'  # 'dating' or 'friendship'
 
+class MatchMessagePayload(BaseModel):
+    content: str
 # ========= Auth =========
 def get_current_user(
     request: Request,
@@ -852,15 +855,15 @@ def build_comment_tree(comments):
 
 
 
-
-
-
 # ========= Discovery =========
 @api_router.get("/discover/profiles")
-def get_discover_profiles(user: dict = Depends(get_current_user)):
-    """Get profiles to swipe through (Tinder-style discovery)"""
+def get_discover_profiles(
+    swipe_type: Optional[str] = 'dating',
+    user: dict = Depends(get_current_user)
+):
+    """Get profiles to swipe through"""
     
-    swiped = sb.table("profile_swipes").select("swiped_id").eq("swiper_id", user["user_id"]).execute()
+    swiped = sb.table("profile_swipes").select("swiped_id").eq("swiper_id", user["user_id"]).eq("swipe_type", swipe_type).execute()
     swiped_ids = [s["swiped_id"] for s in (swiped.data or [])]
     
     query = sb.table("user_profiles").select("*").neq("user_id", user["user_id"]).eq("onboarding_complete", True)
@@ -869,46 +872,107 @@ def get_discover_profiles(user: dict = Depends(get_current_user)):
         for sid in swiped_ids:
             query = query.neq("user_id", sid)
     
+    # Filter by what user is looking for
+    if swipe_type == 'dating':
+        query = query.or_("looking_for.eq.Dating,looking_for.eq.Both")
+    elif swipe_type == 'friendship':
+        query = query.or_("looking_for.eq.Friendship,looking_for.eq.Both")
+    
     res = query.limit(20).execute()
     profiles = res.data or []
     random.shuffle(profiles)
     
-    enriched = []
     for p in profiles:
-        user_data = _maybe(sb.table("users").select("email,ad_tokens,sol_balance,is_upgraded").eq("user_id", p["user_id"]).maybe_single().execute())
+        user_data = _maybe(sb.table("users").select("email").eq("user_id", p["user_id"]).maybe_single().execute())
         p["email"] = user_data.get("email", "") if user_data else ""
-        enriched.append(p)
     
-    return enriched
+    return profiles
 
 @api_router.get("/discover/matches")
-def get_matches(user: dict = Depends(get_current_user)):
-    """Get list of matches for current user"""
+def get_matches(
+    swipe_type: Optional[str] = 'dating',
+    user: dict = Depends(get_current_user)
+):
+    """Get matches filtered by type"""
     
-    matches = sb.table("profile_matches").select("*").or_(f"user1_id.eq.{user['user_id']},user2_id.eq.{user['user_id']}").order("created_at", desc=True).execute()
+    matches = sb.table("profile_matches").select("*").or_(
+        f"user1_id.eq.{user['user_id']},user2_id.eq.{user['user_id']}"
+    ).eq("swipe_type", swipe_type).order("created_at", desc=True).execute()
     
     result = []
     for m in (matches.data or []):
         partner_id = m["user2_id"] if m["user1_id"] == user["user_id"] else m["user1_id"]
         partner_profile = _maybe(sb.table("user_profiles").select("*").eq("user_id", partner_id).maybe_single().execute())
+        partner_user = _maybe(sb.table("users").select("email,picture").eq("user_id", partner_id).maybe_single().execute())
+        
+        # Get last message
+        last_msg = _maybe(sb.table("match_messages").select("*").eq("match_id", m["match_id"]).order("created_at", desc=True).limit(1).execute())
+        last_message = last_msg[0] if last_msg else None
         
         if partner_profile:
             result.append({
                 "match_id": m["match_id"],
                 "user_id": partner_id,
                 "display_name": partner_profile.get("display_name", ""),
-                "profile_image": partner_profile.get("profile_image", ""),
+                "profile_image": partner_profile.get("profile_image", partner_user.get("picture", "") if partner_user else ""),
                 "bio": partner_profile.get("bio", ""),
                 "country": partner_profile.get("country", ""),
                 "city": partner_profile.get("city", ""),
+                "health_status": partner_profile.get("health_status"),
+                "last_message": last_message.get("content") if last_message else None,
+                "last_message_time": last_message.get("created_at") if last_message else None,
                 "created_at": m["created_at"],
             })
     
     return result
 
+@api_router.get("/discover/matches/{match_id}/messages")
+def get_match_messages(match_id: str, user: dict = Depends(get_current_user)):
+    """Get chat messages for a match"""
+    
+    match = _maybe(sb.table("profile_matches").select("*").eq("match_id", match_id).maybe_single().execute())
+    if not match:
+        raise HTTPException(status_code=404, detail="Match not found")
+    
+    if user["user_id"] not in [match["user1_id"], match["user2_id"]]:
+        raise HTTPException(status_code=403, detail="Not your match")
+    
+    messages = sb.table("match_messages").select("*").eq("match_id", match_id).order("created_at").execute()
+    
+    # Mark messages as read
+    for msg in (messages.data or []):
+        if msg["sender_id"] != user["user_id"] and not msg.get("read"):
+            sb.table("match_messages").update({"read": True}).eq("message_id", msg["message_id"]).execute()
+    
+    return messages.data or []
+
+@api_router.post("/discover/matches/{match_id}/messages")
+def send_match_message(match_id: str, payload: MatchMessagePayload, user: dict = Depends(get_current_user)):
+    """Send a message in a match chat"""
+    
+    match = _maybe(sb.table("profile_matches").select("*").eq("match_id", match_id).maybe_single().execute())
+    if not match:
+        raise HTTPException(status_code=404, detail="Match not found")
+    
+    if user["user_id"] not in [match["user1_id"], match["user2_id"]]:
+        raise HTTPException(status_code=403, detail="Not your match")
+    
+    message = {
+        "message_id": f"msg_{uuid.uuid4().hex[:12]}",
+        "match_id": match_id,
+        "sender_id": user["user_id"],
+        "content": payload.content,
+        "read": False,
+        "created_at": datetime.now(timezone.utc).isoformat(),
+    }
+    
+    sb.table("match_messages").insert(message).execute()
+    
+    return {"ok": True, "message": message}
+
 @api_router.post("/discover/swipe")
 def swipe_profile(payload: SwipePayload, user: dict = Depends(get_current_user)):
-    """Swipe left (pass) or right (like) on a profile"""
+    """Swipe left or right on a profile"""
     
     if payload.direction not in ["like", "pass"]:
         raise HTTPException(status_code=400, detail="Direction must be 'like' or 'pass'")
@@ -917,7 +981,7 @@ def swipe_profile(payload: SwipePayload, user: dict = Depends(get_current_user))
     if not target:
         raise HTTPException(status_code=404, detail="Profile not found")
     
-    existing = _maybe(sb.table("profile_swipes").select("*").eq("swiper_id", user["user_id"]).eq("swiped_id", payload.swiped_id).maybe_single().execute())
+    existing = _maybe(sb.table("profile_swipes").select("*").eq("swiper_id", user["user_id"]).eq("swiped_id", payload.swiped_id).eq("swipe_type", payload.swipe_type).maybe_single().execute())
     
     if not existing:
         sb.table("profile_swipes").insert({
@@ -925,31 +989,34 @@ def swipe_profile(payload: SwipePayload, user: dict = Depends(get_current_user))
             "swiper_id": user["user_id"],
             "swiped_id": payload.swiped_id,
             "direction": payload.direction,
+            "swipe_type": payload.swipe_type,
             "created_at": datetime.now(timezone.utc).isoformat(),
         }).execute()
     
     matched = False
+    match_id = None
     
     if payload.direction == "like":
-        other_swipe = _maybe(sb.table("profile_swipes").select("*").eq("swiper_id", payload.swiped_id).eq("swiped_id", user["user_id"]).eq("direction", "like").maybe_single().execute())
+        other_swipe = _maybe(sb.table("profile_swipes").select("*").eq("swiper_id", payload.swiped_id).eq("swiped_id", user["user_id"]).eq("direction", "like").eq("swipe_type", payload.swipe_type).maybe_single().execute())
         
         if other_swipe:
             uid1, uid2 = sorted([user["user_id"], payload.swiped_id])
-            existing_match = _maybe(sb.table("profile_matches").select("*").eq("user1_id", uid1).eq("user2_id", uid2).maybe_single().execute())
+            existing_match = _maybe(sb.table("profile_matches").select("*").eq("user1_id", uid1).eq("user2_id", uid2).eq("swipe_type", payload.swipe_type).maybe_single().execute())
             
             if not existing_match:
+                match_id = f"match_{uuid.uuid4().hex[:12]}"
                 sb.table("profile_matches").insert({
-                    "match_id": f"match_{uuid.uuid4().hex[:12]}",
+                    "match_id": match_id,
                     "user1_id": uid1,
                     "user2_id": uid2,
+                    "swipe_type": payload.swipe_type,
                     "created_at": datetime.now(timezone.utc).isoformat(),
                 }).execute()
                 matched = True
+            else:
+                match_id = existing_match["match_id"]
     
-    return {"ok": True, "matched": matched, "direction": payload.direction}
-
-
-
+    return {"ok": True, "matched": matched, "match_id": match_id, "direction": payload.direction}
 
 
 
