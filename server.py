@@ -33,7 +33,6 @@ INITIAL_AD_TOKENS = 3
 DIAMOND_BOOST_COST = 5
 DIAMOND_BOOST_MINUTES = 10
 
-# Solana/Phantom Constants
 UPGRADE_COST_SOL = 0.012
 MONTHLY_SERVICE_FEE_SOL = 0.01
 DEFAULT_VOTE_COST_SOL = 0.001
@@ -108,7 +107,6 @@ class PayfastInitiatePayload(BaseModel):
     return_url: str
     cancel_url: str
 
-# ========= Profile Models =========
 class ProfileSetupPayload(BaseModel):
     date_of_birth: str
     gender: str
@@ -134,6 +132,15 @@ class ProfileUpdatePayload(BaseModel):
     looking_for: Optional[str] = None
     profile_image: Optional[str] = None
     gallery_images: Optional[List[str]] = None
+
+class CreateStoryPayload(BaseModel):
+    content: str
+    category: str
+    title: Optional[str] = ""
+
+class CreateCommentPayload(BaseModel):
+    content: str
+    parent_id: Optional[str] = None
 
 # ========= Auth =========
 def get_current_user(
@@ -246,7 +253,6 @@ def auth_google(payload: GoogleAuthPayload, response: Response):
 def auth_me(user: dict = Depends(get_current_user)):
     check_service_fee(user)
     
-    # Check if profile onboarding is complete
     profile = _maybe(sb.table("user_profiles").select("onboarding_complete").eq("user_id", user["user_id"]).maybe_single().execute())
     onboarding_complete = profile.get("onboarding_complete", False) if profile else False
     
@@ -474,7 +480,6 @@ def get_marketplace(
     user: dict = Depends(get_current_user),
     filter_type: Optional[str] = None
 ):
-    """Get marketplace. Free users see only smartlink. Upgraded users can filter."""
     now_iso = datetime.now(timezone.utc).isoformat()
     is_upgraded = user.get("is_upgraded", False)
     
@@ -607,7 +612,6 @@ def image_library(user: dict = Depends(get_current_user)):
 
 # ========= Profile =========
 def get_profile(user: dict) -> dict:
-    """Helper to fetch a user's profile with all fields"""
     profile = _maybe(sb.table("user_profiles").select("*").eq("user_id", user["user_id"]).maybe_single().execute())
     
     if not profile:
@@ -649,8 +653,6 @@ def get_profile(user: dict) -> dict:
 
 @api_router.post("/profile/setup")
 def setup_profile(payload: ProfileSetupPayload, user: dict = Depends(get_current_user)):
-    """Complete onboarding after first login"""
-    
     existing = _maybe(sb.table("user_profiles").select("*").eq("user_id", user["user_id"]).maybe_single().execute())
     
     profile_data = {
@@ -680,8 +682,6 @@ def setup_profile(payload: ProfileSetupPayload, user: dict = Depends(get_current
 
 @api_router.put("/profile")
 def update_profile(payload: ProfileUpdatePayload, user: dict = Depends(get_current_user)):
-    """Update profile fields"""
-    
     updates = {}
     for field in ["date_of_birth", "gender", "country", "city", "health_status", 
                    "display_name", "bio", "interests", "looking_for", "profile_image", "gallery_images"]:
@@ -694,7 +694,6 @@ def update_profile(payload: ProfileUpdatePayload, user: dict = Depends(get_curre
     
     updates["updated_at"] = datetime.now(timezone.utc).isoformat()
     
-    # Check if profile exists
     existing = _maybe(sb.table("user_profiles").select("user_id").eq("user_id", user["user_id"]).maybe_single().execute())
     
     if existing:
@@ -709,8 +708,139 @@ def update_profile(payload: ProfileUpdatePayload, user: dict = Depends(get_curre
 
 @api_router.get("/profile")
 def get_my_profile(user: dict = Depends(get_current_user)):
-    """Get current user's profile"""
     return get_profile(user)
+
+# ========= Stories =========
+@api_router.post("/stories")
+def create_story(payload: CreateStoryPayload, user: dict = Depends(get_current_user)):
+    if payload.category not in ["HIV", "HPV", "HSV"]:
+        raise HTTPException(status_code=400, detail="Category must be HIV, HPV, or HSV")
+    
+    profile = _maybe(sb.table("user_profiles").select("*").eq("user_id", user["user_id"]).maybe_single().execute())
+    
+    story = {
+        "story_id": f"story_{uuid.uuid4().hex[:12]}",
+        "user_id": user["user_id"],
+        "author_name": profile.get("display_name", user.get("name", "")) if profile else user.get("name", ""),
+        "author_avatar": profile.get("profile_image", user.get("picture", "")) if profile else user.get("picture", ""),
+        "content": payload.content,
+        "category": payload.category,
+        "title": payload.title or "",
+        "likes": 0,
+        "comment_count": 0,
+        "created_at": datetime.now(timezone.utc).isoformat(),
+        "updated_at": datetime.now(timezone.utc).isoformat(),
+    }
+    
+    sb.table("stories").insert(story).execute()
+    return {"ok": True, "story": story}
+
+@api_router.get("/stories")
+def get_stories(category: Optional[str] = None, user: dict = Depends(get_current_user)):
+    query = sb.table("stories").select("*").order("created_at", desc=True).limit(100)
+    
+    if category and category in ["HIV", "HPV", "HSV"]:
+        query = query.eq("category", category)
+    
+    res = query.execute()
+    stories = res.data or []
+    
+    for story in stories:
+        like = _maybe(sb.table("story_likes").select("like_id").eq("user_id", user["user_id"]).eq("story_id", story["story_id"]).maybe_single().execute())
+        story["liked_by_user"] = like is not None
+    
+    return stories
+
+@api_router.get("/stories/{story_id}")
+def get_story(story_id: str, user: dict = Depends(get_current_user)):
+    story = _maybe(sb.table("stories").select("*").eq("story_id", story_id).maybe_single().execute())
+    if not story:
+        raise HTTPException(status_code=404, detail="Story not found")
+    
+    like = _maybe(sb.table("story_likes").select("like_id").eq("user_id", user["user_id"]).eq("story_id", story_id).maybe_single().execute())
+    story["liked_by_user"] = like is not None
+    
+    comments = sb.table("story_comments").select("*").eq("story_id", story_id).order("created_at").execute()
+    story["comments"] = build_comment_tree(comments.data or [])
+    
+    return story
+
+@api_router.post("/stories/{story_id}/like")
+def like_story(story_id: str, user: dict = Depends(get_current_user)):
+    existing = _maybe(sb.table("story_likes").select("*").eq("user_id", user["user_id"]).eq("story_id", story_id).maybe_single().execute())
+    
+    story = _maybe(sb.table("stories").select("likes").eq("story_id", story_id).maybe_single().execute())
+    if not story:
+        raise HTTPException(status_code=404, detail="Story not found")
+    
+    current_likes = story.get("likes", 0)
+    
+    if existing:
+        sb.table("story_likes").delete().eq("like_id", existing["like_id"]).execute()
+        new_likes = max(current_likes - 1, 0)
+        sb.table("stories").update({"likes": new_likes}).eq("story_id", story_id).execute()
+        return {"ok": True, "liked": False}
+    else:
+        sb.table("story_likes").insert({
+            "like_id": f"like_{uuid.uuid4().hex[:12]}",
+            "user_id": user["user_id"],
+            "story_id": story_id,
+            "created_at": datetime.now(timezone.utc).isoformat(),
+        }).execute()
+        sb.table("stories").update({"likes": current_likes + 1}).eq("story_id", story_id).execute()
+        return {"ok": True, "liked": True}
+
+@api_router.post("/stories/{story_id}/comments")
+def create_comment(story_id: str, payload: CreateCommentPayload, user: dict = Depends(get_current_user)):
+    story = _maybe(sb.table("stories").select("story_id,comment_count").eq("story_id", story_id).maybe_single().execute())
+    if not story:
+        raise HTTPException(status_code=404, detail="Story not found")
+    
+    if payload.parent_id:
+        parent = _maybe(sb.table("story_comments").select("comment_id").eq("comment_id", payload.parent_id).eq("story_id", story_id).maybe_single().execute())
+        if not parent:
+            raise HTTPException(status_code=404, detail="Parent comment not found")
+    
+    profile = _maybe(sb.table("user_profiles").select("*").eq("user_id", user["user_id"]).maybe_single().execute())
+    
+    comment = {
+        "comment_id": f"cmt_{uuid.uuid4().hex[:12]}",
+        "story_id": story_id,
+        "user_id": user["user_id"],
+        "author_name": profile.get("display_name", user.get("name", "")) if profile else user.get("name", ""),
+        "author_avatar": profile.get("profile_image", user.get("picture", "")) if profile else user.get("picture", ""),
+        "content": payload.content,
+        "parent_id": payload.parent_id,
+        "likes": 0,
+        "reply_count": 0,
+        "created_at": datetime.now(timezone.utc).isoformat(),
+    }
+    
+    sb.table("story_comments").insert(comment).execute()
+    
+    # Update counts
+    current_count = story.get("comment_count", 0)
+    sb.table("stories").update({"comment_count": current_count + 1}).eq("story_id", story_id).execute()
+    
+    if payload.parent_id:
+        parent_comment = _maybe(sb.table("story_comments").select("reply_count").eq("comment_id", payload.parent_id).maybe_single().execute())
+        if parent_comment:
+            sb.table("story_comments").update({"reply_count": parent_comment.get("reply_count", 0) + 1}).eq("comment_id", payload.parent_id).execute()
+    
+    return {"ok": True, "comment": comment}
+
+def build_comment_tree(comments):
+    comment_map = {c["comment_id"]: {**c, "replies": []} for c in comments}
+    roots = []
+    
+    for c in comments:
+        node = comment_map[c["comment_id"]]
+        if c.get("parent_id") and c["parent_id"] in comment_map:
+            comment_map[c["parent_id"]]["replies"].append(node)
+        else:
+            roots.append(node)
+    
+    return roots
 
 # ========= PayFast =========
 def _payfast_signature(params: dict, passphrase: str = "") -> str:
