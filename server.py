@@ -142,6 +142,10 @@ class CreateCommentPayload(BaseModel):
     content: str
     parent_id: Optional[str] = None
 
+class SwipePayload(BaseModel):
+    swiped_id: str
+    direction: str  # 'like' or 'pass'
+
 # ========= Auth =========
 def get_current_user(
     request: Request,
@@ -841,6 +845,136 @@ def build_comment_tree(comments):
             roots.append(node)
     
     return roots
+
+
+
+
+
+
+
+
+
+
+# ========= Discovery =========
+@api_router.get("/discover/profiles")
+def get_discover_profiles(user: dict = Depends(get_current_user)):
+    """Get profiles to swipe through (Tinder-style discovery)"""
+    
+    swiped = sb.table("profile_swipes").select("swiped_id").eq("swiper_id", user["user_id"]).execute()
+    swiped_ids = [s["swiped_id"] for s in (swiped.data or [])]
+    
+    query = sb.table("user_profiles").select("*").neq("user_id", user["user_id"]).eq("onboarding_complete", True)
+    
+    if swiped_ids:
+        for sid in swiped_ids:
+            query = query.neq("user_id", sid)
+    
+    res = query.limit(20).execute()
+    profiles = res.data or []
+    random.shuffle(profiles)
+    
+    enriched = []
+    for p in profiles:
+        user_data = _maybe(sb.table("users").select("email,ad_tokens,sol_balance,is_upgraded").eq("user_id", p["user_id"]).maybe_single().execute())
+        p["email"] = user_data.get("email", "") if user_data else ""
+        enriched.append(p)
+    
+    return enriched
+
+@api_router.get("/discover/matches")
+def get_matches(user: dict = Depends(get_current_user)):
+    """Get list of matches for current user"""
+    
+    matches = sb.table("profile_matches").select("*").or_(f"user1_id.eq.{user['user_id']},user2_id.eq.{user['user_id']}").order("created_at", desc=True).execute()
+    
+    result = []
+    for m in (matches.data or []):
+        partner_id = m["user2_id"] if m["user1_id"] == user["user_id"] else m["user1_id"]
+        partner_profile = _maybe(sb.table("user_profiles").select("*").eq("user_id", partner_id).maybe_single().execute())
+        
+        if partner_profile:
+            result.append({
+                "match_id": m["match_id"],
+                "user_id": partner_id,
+                "display_name": partner_profile.get("display_name", ""),
+                "profile_image": partner_profile.get("profile_image", ""),
+                "bio": partner_profile.get("bio", ""),
+                "country": partner_profile.get("country", ""),
+                "city": partner_profile.get("city", ""),
+                "created_at": m["created_at"],
+            })
+    
+    return result
+
+@api_router.post("/discover/swipe")
+def swipe_profile(payload: SwipePayload, user: dict = Depends(get_current_user)):
+    """Swipe left (pass) or right (like) on a profile"""
+    
+    if payload.direction not in ["like", "pass"]:
+        raise HTTPException(status_code=400, detail="Direction must be 'like' or 'pass'")
+    
+    target = _maybe(sb.table("user_profiles").select("user_id").eq("user_id", payload.swiped_id).maybe_single().execute())
+    if not target:
+        raise HTTPException(status_code=404, detail="Profile not found")
+    
+    existing = _maybe(sb.table("profile_swipes").select("*").eq("swiper_id", user["user_id"]).eq("swiped_id", payload.swiped_id).maybe_single().execute())
+    
+    if not existing:
+        sb.table("profile_swipes").insert({
+            "swipe_id": f"swp_{uuid.uuid4().hex[:12]}",
+            "swiper_id": user["user_id"],
+            "swiped_id": payload.swiped_id,
+            "direction": payload.direction,
+            "created_at": datetime.now(timezone.utc).isoformat(),
+        }).execute()
+    
+    matched = False
+    
+    if payload.direction == "like":
+        other_swipe = _maybe(sb.table("profile_swipes").select("*").eq("swiper_id", payload.swiped_id).eq("swiped_id", user["user_id"]).eq("direction", "like").maybe_single().execute())
+        
+        if other_swipe:
+            uid1, uid2 = sorted([user["user_id"], payload.swiped_id])
+            existing_match = _maybe(sb.table("profile_matches").select("*").eq("user1_id", uid1).eq("user2_id", uid2).maybe_single().execute())
+            
+            if not existing_match:
+                sb.table("profile_matches").insert({
+                    "match_id": f"match_{uuid.uuid4().hex[:12]}",
+                    "user1_id": uid1,
+                    "user2_id": uid2,
+                    "created_at": datetime.now(timezone.utc).isoformat(),
+                }).execute()
+                matched = True
+    
+    return {"ok": True, "matched": matched, "direction": payload.direction}
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 # ========= PayFast =========
 def _payfast_signature(params: dict, passphrase: str = "") -> str:
