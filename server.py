@@ -12,7 +12,7 @@ import httpx
 from urllib.parse import quote
 from pathlib import Path
 from pydantic import BaseModel
-from typing import Optional
+from typing import Optional, List
 from datetime import datetime, timezone, timedelta
 
 ROOT_DIR = Path(__file__).parent
@@ -107,6 +107,33 @@ class GoogleAuthPayload(BaseModel):
 class PayfastInitiatePayload(BaseModel):
     return_url: str
     cancel_url: str
+
+# ========= Profile Models =========
+class ProfileSetupPayload(BaseModel):
+    date_of_birth: str
+    gender: str
+    country: str
+    city: str
+    health_status: str
+    display_name: Optional[str] = ""
+    bio: Optional[str] = ""
+    interests: Optional[str] = ""
+    looking_for: Optional[str] = ""
+    profile_image: Optional[str] = ""
+    gallery_images: Optional[List[str]] = []
+
+class ProfileUpdatePayload(BaseModel):
+    date_of_birth: Optional[str] = None
+    gender: Optional[str] = None
+    country: Optional[str] = None
+    city: Optional[str] = None
+    health_status: Optional[str] = None
+    display_name: Optional[str] = None
+    bio: Optional[str] = None
+    interests: Optional[str] = None
+    looking_for: Optional[str] = None
+    profile_image: Optional[str] = None
+    gallery_images: Optional[List[str]] = None
 
 # ========= Auth =========
 def get_current_user(
@@ -219,6 +246,10 @@ def auth_google(payload: GoogleAuthPayload, response: Response):
 def auth_me(user: dict = Depends(get_current_user)):
     check_service_fee(user)
     
+    # Check if profile onboarding is complete
+    profile = _maybe(sb.table("user_profiles").select("onboarding_complete").eq("user_id", user["user_id"]).maybe_single().execute())
+    onboarding_complete = profile.get("onboarding_complete", False) if profile else False
+    
     return {
         "user_id": user["user_id"],
         "email": user["email"],
@@ -242,6 +273,7 @@ def auth_me(user: dict = Depends(get_current_user)):
         "service_fee_paid": user.get("service_fee_paid", False),
         "upgrade_date": user.get("upgrade_date"),
         "last_service_fee_date": user.get("last_service_fee_date"),
+        "onboarding_complete": onboarding_complete,
     }
 
 @api_router.post("/auth/logout")
@@ -449,10 +481,8 @@ def get_marketplace(
     query = sb.table("cards").select("*").gt("expires_at", now_iso).neq("owner_id", user["user_id"])
     
     if not is_upgraded:
-        # Free users only see SmartLink cards
         query = query.or_("card_type.eq.smartlink,card_type.is.null")
     elif filter_type and filter_type in ["smartlink", "crypto"]:
-        # Upgraded users can filter
         if filter_type == "smartlink":
             query = query.or_("card_type.eq.smartlink,card_type.is.null")
         else:
@@ -574,6 +604,113 @@ def referral_me(user: dict = Depends(get_current_user)):
 @api_router.get("/images/library")
 def image_library(user: dict = Depends(get_current_user)):
     return {"images": SYSTEM_IMAGES}
+
+# ========= Profile =========
+def get_profile(user: dict) -> dict:
+    """Helper to fetch a user's profile with all fields"""
+    profile = _maybe(sb.table("user_profiles").select("*").eq("user_id", user["user_id"]).maybe_single().execute())
+    
+    if not profile:
+        return {
+            "user_id": user["user_id"],
+            "email": user.get("email", ""),
+            "name": user.get("name", ""),
+            "date_of_birth": None,
+            "gender": None,
+            "country": None,
+            "city": None,
+            "health_status": None,
+            "display_name": user.get("name", ""),
+            "bio": "",
+            "interests": "",
+            "looking_for": "",
+            "profile_image": user.get("picture", ""),
+            "gallery_images": [],
+            "onboarding_complete": False,
+        }
+    
+    return {
+        "user_id": profile["user_id"],
+        "email": user.get("email", ""),
+        "name": user.get("name", ""),
+        "date_of_birth": profile.get("date_of_birth"),
+        "gender": profile.get("gender"),
+        "country": profile.get("country"),
+        "city": profile.get("city"),
+        "health_status": profile.get("health_status"),
+        "display_name": profile.get("display_name", user.get("name", "")),
+        "bio": profile.get("bio", ""),
+        "interests": profile.get("interests", ""),
+        "looking_for": profile.get("looking_for", ""),
+        "profile_image": profile.get("profile_image", user.get("picture", "")),
+        "gallery_images": profile.get("gallery_images", []),
+        "onboarding_complete": profile.get("onboarding_complete", False),
+    }
+
+@api_router.post("/profile/setup")
+def setup_profile(payload: ProfileSetupPayload, user: dict = Depends(get_current_user)):
+    """Complete onboarding after first login"""
+    
+    existing = _maybe(sb.table("user_profiles").select("*").eq("user_id", user["user_id"]).maybe_single().execute())
+    
+    profile_data = {
+        "user_id": user["user_id"],
+        "date_of_birth": payload.date_of_birth,
+        "gender": payload.gender,
+        "country": payload.country,
+        "city": payload.city,
+        "health_status": payload.health_status,
+        "display_name": payload.display_name or user.get("name", ""),
+        "bio": payload.bio or "",
+        "interests": payload.interests or "",
+        "looking_for": payload.looking_for or "",
+        "profile_image": payload.profile_image or user.get("picture", ""),
+        "gallery_images": payload.gallery_images or [],
+        "onboarding_complete": True,
+        "updated_at": datetime.now(timezone.utc).isoformat(),
+    }
+    
+    if existing:
+        sb.table("user_profiles").update(profile_data).eq("user_id", user["user_id"]).execute()
+    else:
+        profile_data["created_at"] = datetime.now(timezone.utc).isoformat()
+        sb.table("user_profiles").insert(profile_data).execute()
+    
+    return {"ok": True, "profile": get_profile(user)}
+
+@api_router.put("/profile")
+def update_profile(payload: ProfileUpdatePayload, user: dict = Depends(get_current_user)):
+    """Update profile fields"""
+    
+    updates = {}
+    for field in ["date_of_birth", "gender", "country", "city", "health_status", 
+                   "display_name", "bio", "interests", "looking_for", "profile_image", "gallery_images"]:
+        value = getattr(payload, field, None)
+        if value is not None:
+            updates[field] = value
+    
+    if not updates:
+        return {"ok": True, "profile": get_profile(user)}
+    
+    updates["updated_at"] = datetime.now(timezone.utc).isoformat()
+    
+    # Check if profile exists
+    existing = _maybe(sb.table("user_profiles").select("user_id").eq("user_id", user["user_id"]).maybe_single().execute())
+    
+    if existing:
+        sb.table("user_profiles").update(updates).eq("user_id", user["user_id"]).execute()
+    else:
+        updates["user_id"] = user["user_id"]
+        updates["onboarding_complete"] = False
+        updates["created_at"] = datetime.now(timezone.utc).isoformat()
+        sb.table("user_profiles").insert(updates).execute()
+    
+    return {"ok": True, "profile": get_profile(user)}
+
+@api_router.get("/profile")
+def get_my_profile(user: dict = Depends(get_current_user)):
+    """Get current user's profile"""
+    return get_profile(user)
 
 # ========= PayFast =========
 def _payfast_signature(params: dict, passphrase: str = "") -> str:
