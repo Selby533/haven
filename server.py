@@ -423,8 +423,12 @@ def setup_profile(payload: ProfileSetupPayload, user: dict = Depends(get_current
         sb.table("user_profiles").insert(profile_data).execute()
     return {"ok": True, "profile": get_profile(user)}
 
+#api_router.put("/profile")
+#def update_profile(payload: ProfileUpdatePayload, user: dict = Depends(get_current_user)):
 @api_router.put("/profile")
-def update_profile(payload: ProfileUpdatePayload, user: dict = Depends(get_current_user)):
+async def update_profile(payload: ProfileUpdatePayload, user: dict = Depends(get_current_user)):
+
+
     updates = {}
     all_fields = [
         "date_of_birth", "gender", "country", "city", "health_status",
