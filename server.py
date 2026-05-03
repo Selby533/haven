@@ -167,11 +167,8 @@ def get_current_user(
     check_service_fee(user)
     return user
 
-@app.get("/")
-def root(): return {"message": "Haven API is running"}
-
-@api_router.get("/")
-def api_root(): return {"message": "Haven API"}
+@app.get("/") ; def root(): return {"message": "Haven API is running"}
+@api_router.get("/") ; def api_root(): return {"message": "Haven API"}
 
 @api_router.post("/auth/google")
 def auth_google(payload: GoogleAuthPayload, response: Response):
@@ -240,7 +237,8 @@ def check_service_fee(user: dict):
         if datetime.now(timezone.utc) > _parse_dt(last_fee) + timedelta(days=30):
             sb.table("users").update({"service_fee_paid": False}).eq("user_id", user["user_id"]).execute()
     else:
-        sb.table("users").update({"last_service_fee_date": datetime.now(timezone.utc).isoformat(), "service_fee_paid": True}).eq("user_id", user["user_id"]).execute()
+        now = datetime.now(timezone.utc)
+        sb.table("users").update({"last_service_fee_date": now.isoformat(), "service_fee_paid": True}).eq("user_id", user["user_id"]).execute()
 
 # ---------- Wallet & Upgrade ----------
 @api_router.post("/wallet/connect")
@@ -264,13 +262,13 @@ def verify_service_fee(payload: ServiceFeeRequest, user: dict = Depends(get_curr
     existing = _maybe(sb.table("sol_transactions").select("tx_id").eq("tx_hash", payload.tx_hash).maybe_single().execute())
     if existing: raise HTTPException(400, "Transaction already used")
     now = datetime.now(timezone.utc)
-    sb.table("sol_transactions").insert({"tx_id": f"fee_{uuid.uuid4().hex[:12]}", "from_user_id": user["user_id"], "to_user_id": None, "tx_type": "service_fee", "amount_sol": MONTHLY_SERVICE_FEE_SOL, "tx_hash": payload.tx_hash, "status": "confirmed", "confirmed_at": now.isoformat()}).execute()
+    sb.table("sol_transactions").insert({"tx_id": f"fee_{uuid.uuid4().hex[:12]}", "from_user_id": user["user_id"], "to_user_id": None, "tx_type": "service_fee", "amount_sol": MONTHLY_SERVICE_FEE_SOL, "tx_hash": payload.tx_hash, "status": "confirmed"}).execute()
     sb.table("users").update({"last_service_fee_date": now.isoformat(), "service_fee_paid": True}).eq("user_id", user["user_id"]).execute()
     return {"ok": True, "next_fee_due": (now+timedelta(days=30)).isoformat(), "service_fee_paid": True}
 
 # ---------- Cards ----------
 def _card_public(doc: dict) -> dict:
-    return {"card_id": doc["card_id"], "owner_id": doc["owner_id"], "owner_name": doc.get("owner_name", ""), "image_url": doc["image_url"], "smart_link": doc.get("smart_link", ""), "title": doc.get("title", ""), "votes": doc.get("votes", 0), "created_at": doc["created_at"], "expires_at": doc["expires_at"], "is_premium": doc.get("is_premium", False), "diamond_boosted": doc.get("diamond_boosted", False), "card_type": doc.get("card_type", "smartlink"), "vote_cost_sol": doc.get("vote_cost_sol", DEFAULT_VOTE_COST_SOL), "owner_wallet": doc.get("owner_wallet")}
+    return {"card_id": doc["card_id"], "owner_id": doc["owner_id"], "owner_name": doc.get("owner_name",""), "image_url": doc["image_url"], "smart_link": doc.get("smart_link",""), "title": doc.get("title",""), "votes": doc.get("votes",0), "created_at": doc["created_at"], "expires_at": doc["expires_at"], "is_premium": doc.get("is_premium",False), "diamond_boosted": doc.get("diamond_boosted",False), "card_type": doc.get("card_type","smartlink"), "vote_cost_sol": doc.get("vote_cost_sol",DEFAULT_VOTE_COST_SOL), "owner_wallet": doc.get("owner_wallet")}
 
 @api_router.post("/cards")
 def create_card(payload: CardCreate, user: dict = Depends(get_current_user)):
@@ -289,7 +287,7 @@ def create_card(payload: CardCreate, user: dict = Depends(get_current_user)):
     base_ttl = PREMIUM_CARD_TTL_MINUTES if user.get("is_premium") else FREE_CARD_TTL_MINUTES
     now = datetime.now(timezone.utc)
     expires = now + timedelta(minutes=base_ttl)
-    card = {"card_id": f"card_{uuid.uuid4().hex[:12]}", "owner_id": user["user_id"], "owner_name": user.get("name", ""), "image_url": payload.image_url, "smart_link": smart_link, "title": payload.title or "", "votes": 0, "created_at": now.isoformat(), "expires_at": expires.isoformat(), "is_premium": bool(user.get("is_premium", False)), "diamond_boosted": False, "card_type": card_type, "vote_cost_sol": payload.vote_cost_sol if card_type == "crypto" else 0.0, "owner_wallet": recipient_wallet}
+    card = {"card_id": f"card_{uuid.uuid4().hex[:12]}", "owner_id": user["user_id"], "owner_name": user.get("name",""), "image_url": payload.image_url, "smart_link": smart_link, "title": payload.title or "", "votes": 0, "created_at": now.isoformat(), "expires_at": expires.isoformat(), "is_premium": bool(user.get("is_premium",False)), "diamond_boosted": False, "card_type": card_type, "vote_cost_sol": payload.vote_cost_sol if card_type == "crypto" else 0.0, "owner_wallet": recipient_wallet}
     sb.table("cards").insert(card).execute()
     if token_cost > 0: sb.table("users").update({"ad_tokens": user["ad_tokens"] - 1}).eq("user_id", user["user_id"]).execute()
     if payload.use_diamond_boost: sb.table("users").update({"diamonds": user.get("diamonds", 0) - DIAMOND_BOOST_COST}).eq("user_id", user["user_id"]).execute()
@@ -314,15 +312,15 @@ def get_my_cards(user: dict = Depends(get_current_user)):
 def vote_card(card_id: str, user: dict = Depends(get_current_user)):
     card = _maybe(sb.table("cards").select("*").eq("card_id", card_id).maybe_single().execute())
     if not card: raise HTTPException(404, "Card not found")
-    if card["owner_id"] == user["user_id"]: raise HTTPException(400, "Cannot vote on your own card")
+    if card["owner_id"] == user["user_id"]: raise HTTPException(400)
     if _parse_dt(card["expires_at"]) < datetime.now(timezone.utc): raise HTTPException(400, "Card has expired")
     if card.get("card_type") == "crypto": raise HTTPException(400, "Use crypto-vote")
     sb.table("votes").insert({"vote_id": f"vote_{uuid.uuid4().hex[:12]}", "voter_id": user["user_id"], "card_id": card_id, "owner_id": card["owner_id"]}).execute()
-    sb.table("cards").update({"votes": card.get("votes", 0) + 1}).eq("card_id", card_id).execute()
-    new_progress = user.get("votes_since_token", 0) + 1
+    sb.table("cards").update({"votes": card.get("votes",0)+1}).eq("card_id", card_id).execute()
+    new_progress = user.get("votes_since_token",0) + 1
     tokens_earned = new_progress // VOTES_PER_TOKEN
     new_progress %= VOTES_PER_TOKEN
-    new_tokens = user.get("ad_tokens", 0) + tokens_earned
+    new_tokens = user.get("ad_tokens",0) + tokens_earned
     sb.table("users").update({"votes_since_token": new_progress, "ad_tokens": new_tokens}).eq("user_id", user["user_id"]).execute()
     return {"ok": True, "smart_link": card["smart_link"], "ad_tokens": new_tokens, "votes_since_token": new_progress, "tokens_earned": tokens_earned}
 
@@ -340,25 +338,36 @@ def crypto_vote_card(card_id: str, payload: CryptoVoteRequest, user: dict = Depe
     vote_cost = card.get("vote_cost_sol", DEFAULT_VOTE_COST_SOL)
     now = datetime.now(timezone.utc)
     sb.table("sol_transactions").insert({"tx_id": f"cv_{uuid.uuid4().hex[:12]}", "from_user_id": user["user_id"], "to_user_id": card["owner_id"], "tx_type": "vote_reward", "amount_sol": vote_cost, "tx_hash": payload.tx_hash, "status": "confirmed"}).execute()
-    sb.table("cards").update({"votes": card.get("votes",0) + 1}).eq("card_id", card_id).execute()
+    sb.table("cards").update({"votes": card.get("votes",0)+1}).eq("card_id", card_id).execute()
     sb.table("users").update({"sol_balance": float(owner.get("sol_balance",0)) + vote_cost}).eq("user_id", card["owner_id"]).execute()
     return {"ok": True, "votes": card.get("votes",0)+1, "amount_sol": vote_cost}
+
+# ---------- Referral ----------
+@api_router.get("/referral/me")
+def referral_me(user: dict = Depends(get_current_user)):
+    return {"referral_code": user.get("referral_code"), "diamonds": user.get("diamonds",0), "diamond_boost_cost": DIAMOND_BOOST_COST, "diamond_boost_minutes": DIAMOND_BOOST_MINUTES}
+
+@api_router.get("/images/library")
+def image_library(user: dict = Depends(get_current_user)):
+    return {"images": SYSTEM_IMAGES}
 
 # ---------- Profile ----------
 def get_profile(user: dict) -> dict:
     profile = _maybe(sb.table("user_profiles").select("*").eq("user_id", user["user_id"]).maybe_single().execute())
     if not profile:
-        return {"user_id": user["user_id"], "email": user.get("email",""), "name": user.get("name",""),
-                "date_of_birth": None, "gender": None, "country": None, "city": None,
-                "health_status": None, "latitude": None, "longitude": None,
-                "display_name": user.get("name",""), "bio": "", "interests": "", "looking_for": "",
-                "education": "", "kids": "", "want_kids": "", "smoke": "", "drink": "", "employment": "",
-                "profile_image": user.get("picture",""), "gallery_images": [],
-                "onboarding_complete": False,
-                "pref_gender": "", "pref_min_age": 18, "pref_max_age": 99,
-                "pref_country": "", "pref_max_distance": 50, "pref_health_status": "",
-                "profile_hidden": False, "hide_from_min_age": None, "hide_from_max_age": None,
-                "hide_from_health_statuses": ""}
+        return {
+            "user_id": user["user_id"], "email": user.get("email",""), "name": user.get("name",""),
+            "date_of_birth": None, "gender": None, "country": None, "city": None,
+            "health_status": None, "latitude": None, "longitude": None,
+            "display_name": user.get("name",""), "bio": "", "interests": "", "looking_for": "",
+            "education": "", "kids": "", "want_kids": "", "smoke": "", "drink": "", "employment": "",
+            "profile_image": user.get("picture",""), "gallery_images": [],
+            "onboarding_complete": False,
+            "pref_gender": "", "pref_min_age": 18, "pref_max_age": 99,
+            "pref_country": "", "pref_max_distance": 50, "pref_health_status": "",
+            "profile_hidden": False, "hide_from_min_age": None, "hide_from_max_age": None,
+            "hide_from_health_statuses": ""
+        }
     return {
         "user_id": profile["user_id"], "email": user.get("email",""), "name": user.get("name",""),
         "date_of_birth": profile.get("date_of_birth"), "gender": profile.get("gender"),
@@ -386,7 +395,6 @@ def get_profile(user: dict) -> dict:
 
 @api_router.post("/profile/setup")
 def setup_profile(payload: ProfileSetupPayload, user: dict = Depends(get_current_user)):
-    # Geocode if lat/lon missing
     lat, lon = payload.latitude, payload.longitude
     if (lat is None or lon is None) and payload.city and payload.country:
         lat, lon = geocode_city(payload.city, payload.country)
@@ -423,12 +431,8 @@ def setup_profile(payload: ProfileSetupPayload, user: dict = Depends(get_current
         sb.table("user_profiles").insert(profile_data).execute()
     return {"ok": True, "profile": get_profile(user)}
 
-#api_router.put("/profile")
-#def update_profile(payload: ProfileUpdatePayload, user: dict = Depends(get_current_user)):
 @api_router.put("/profile")
 async def update_profile(payload: ProfileUpdatePayload, user: dict = Depends(get_current_user)):
-
-
     updates = {}
     all_fields = [
         "date_of_birth", "gender", "country", "city", "health_status",
@@ -466,44 +470,35 @@ async def update_profile(payload: ProfileUpdatePayload, user: dict = Depends(get
 def get_my_profile(user: dict = Depends(get_current_user)):
     return get_profile(user)
 
-# ---------- Discovery (using saved preferences) ----------
+# ---------- Discovery ----------
 @api_router.get("/discover/profiles")
 def get_discover_profiles(user: dict = Depends(get_current_user)):
-    """Return profiles filtered by viewer's own saved discovery preferences."""
     viewer_profile = _maybe(sb.table("user_profiles").select("*").eq("user_id", user["user_id"]).maybe_single().execute())
-    if not viewer_profile:
-        return []
-    # Viewer preferences
-    pref_gender = viewer_profile.get("pref_gender", "")
-    pref_min_age = viewer_profile.get("pref_min_age", 18)
-    pref_max_age = viewer_profile.get("pref_max_age", 99)
-    pref_country = viewer_profile.get("pref_country", "")
-    pref_max_distance = viewer_profile.get("pref_max_distance", 50)
-    pref_health_status = viewer_profile.get("pref_health_status", "")
-    # Viewer location for distance
+    if not viewer_profile: return []
+    pref_gender = viewer_profile.get("pref_gender","")
+    pref_min_age = viewer_profile.get("pref_min_age",18)
+    pref_max_age = viewer_profile.get("pref_max_age",99)
+    pref_country = viewer_profile.get("pref_country","")
+    pref_max_distance = viewer_profile.get("pref_max_distance",50)
+    pref_health_status = viewer_profile.get("pref_health_status","")
     my_lat = viewer_profile.get("latitude")
     my_lon = viewer_profile.get("longitude")
     today = datetime.now(timezone.utc).date()
-
-    # Get all completed profiles except viewer and already matched
     matches = sb.table("profile_matches").select("*").or_(f"user1_id.eq.{user['user_id']},user2_id.eq.{user['user_id']}").execute()
     matched_ids = set()
     for m in (matches.data or []):
         partner = m["user2_id"] if m["user1_id"] == user["user_id"] else m["user1_id"]
         matched_ids.add(partner)
-
     query = sb.table("user_profiles").select("*").neq("user_id", user["user_id"]).eq("onboarding_complete", True)
     for mid in matched_ids:
         query = query.neq("user_id", mid)
-
     profiles = (query.limit(200).execute()).data or []
     filtered = []
     for p in profiles:
-        # Check if viewer falls into this profile's hide criteria
         if p.get("profile_hidden"): continue
         hide_min = p.get("hide_from_min_age")
         hide_max = p.get("hide_from_max_age")
-        hide_health = p.get("hide_from_health_statuses", "")
+        hide_health = p.get("hide_from_health_statuses","")
         viewer_age = None
         if viewer_profile.get("date_of_birth"):
             try:
@@ -514,19 +509,16 @@ def get_discover_profiles(user: dict = Depends(get_current_user)):
             continue
         if hide_health and viewer_profile.get("health_status") in [x.strip() for x in hide_health.split(",") if x.strip()]:
             continue
-        # Apply viewer's discovery preferences
         if pref_gender and p.get("gender") != pref_gender: continue
+        age = None
         if p.get("date_of_birth"):
             try:
                 dob = datetime.fromisoformat(str(p["date_of_birth"])).date()
                 age = today.year - dob.year - ((today.month, today.day) < (dob.month, dob.day))
-            except: age = None
-        else: age = None
-        if age is not None:
-            if age < pref_min_age or age > pref_max_age: continue
+            except: pass
+        if age is not None and (age < pref_min_age or age > pref_max_age): continue
         if pref_health_status and p.get("health_status") != pref_health_status: continue
         if pref_country and p.get("country") != pref_country: continue
-        # Distance filter
         distance = None
         if my_lat and my_lon and p.get("latitude") and p.get("longitude"):
             distance = haversine(my_lat, my_lon, p["latitude"], p["longitude"])
@@ -598,11 +590,33 @@ def swipe_profile(payload: SwipePayload, user: dict = Depends(get_current_user))
 # ---------- Location APIs ----------
 @api_router.get("/location/countries")
 def get_countries():
+    try:
+        resp = httpx.get("https://restcountries.com/v3.1/all?fields=name,cca2", timeout=5)
+        if resp.status_code == 200:
+            return [{"code": c["cca2"], "name": c["name"]["common"]} for c in resp.json()]
+    except: pass
+    # Fallback
     return [
-        {"code": "AF", "name": "Afghanistan"}, {"code": "ZA", "name": "South Africa"},
-        {"code": "US", "name": "United States"}, {"code": "GB", "name": "United Kingdom"},
-        # ... keep the full list from earlier, or use the previous one
-    ] + [{"code": "ZW", "name": "Zimbabwe"}]
+        {"code":"AF","name":"Afghanistan"},{"code":"AL","name":"Albania"},{"code":"DZ","name":"Algeria"},
+        {"code":"AR","name":"Argentina"},{"code":"AU","name":"Australia"},{"code":"AT","name":"Austria"},
+        {"code":"BD","name":"Bangladesh"},{"code":"BE","name":"Belgium"},{"code":"BR","name":"Brazil"},
+        {"code":"CA","name":"Canada"},{"code":"CN","name":"China"},{"code":"CO","name":"Colombia"},
+        {"code":"EG","name":"Egypt"},{"code":"FR","name":"France"},{"code":"DE","name":"Germany"},
+        {"code":"GH","name":"Ghana"},{"code":"GR","name":"Greece"},{"code":"IN","name":"India"},
+        {"code":"ID","name":"Indonesia"},{"code":"IR","name":"Iran"},{"code":"IE","name":"Ireland"},
+        {"code":"IL","name":"Israel"},{"code":"IT","name":"Italy"},{"code":"JP","name":"Japan"},
+        {"code":"KE","name":"Kenya"},{"code":"MY","name":"Malaysia"},{"code":"MX","name":"Mexico"},
+        {"code":"MA","name":"Morocco"},{"code":"NL","name":"Netherlands"},{"code":"NZ","name":"New Zealand"},
+        {"code":"NG","name":"Nigeria"},{"code":"PK","name":"Pakistan"},{"code":"PE","name":"Peru"},
+        {"code":"PH","name":"Philippines"},{"code":"PL","name":"Poland"},{"code":"PT","name":"Portugal"},
+        {"code":"RO","name":"Romania"},{"code":"RU","name":"Russia"},{"code":"SA","name":"Saudi Arabia"},
+        {"code":"SG","name":"Singapore"},{"code":"ZA","name":"South Africa"},{"code":"KR","name":"South Korea"},
+        {"code":"ES","name":"Spain"},{"code":"SE","name":"Sweden"},{"code":"CH","name":"Switzerland"},
+        {"code":"TZ","name":"Tanzania"},{"code":"TH","name":"Thailand"},{"code":"TR","name":"Turkey"},
+        {"code":"UG","name":"Uganda"},{"code":"UA","name":"Ukraine"},{"code":"AE","name":"UAE"},
+        {"code":"GB","name":"United Kingdom"},{"code":"US","name":"United States"},{"code":"VN","name":"Vietnam"},
+        {"code":"ZW","name":"Zimbabwe"}
+    ]
 
 @api_router.get("/location/cities")
 def get_cities(country: str):
