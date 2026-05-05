@@ -159,13 +159,21 @@ def process_image_field(image_value: str, user_id: str, filename_prefix: str) ->
     return image_value
 
 def get_proxied_image_url(supabase_url: str) -> str:
+    """Convert stored URL to an absolute public URL, ready for the frontend."""
     if not supabase_url:
         return supabase_url
-    if "/api/images/" in supabase_url:
+
+    # Already a full HTTP URL → return as is (Supabase public URL or backend proxy)
+    if supabase_url.startswith("http"):
         return supabase_url
-    if IMAGE_URL_PREFIX in supabase_url:
-        rel_path = supabase_url.replace(IMAGE_URL_PREFIX, "").lstrip("/")
-        return f"/api/images/{rel_path}"
+
+    # If it's a relative proxy path, use BACKEND_PUBLIC_URL to make it absolute
+    if supabase_url.startswith("/api/images/"):
+        backend_url = os.environ.get("BACKEND_PUBLIC_URL", "").rstrip("/")
+        if backend_url:
+            return f"{backend_url}{supabase_url}"
+        return supabase_url
+
     return supabase_url
 
 # ---------- Models ----------
@@ -253,10 +261,8 @@ def get_current_user(
     check_premium_status(user)
     return user
 
-@app.get("/")
-def root(): return {"message": "Haven API is running"}
-@api_router.get("/")
-def api_root(): return {"message": "Haven API"}
+@app.get("/") ; def root(): return {"message": "Haven API is running"}
+@api_router.get("/") ; def api_root(): return {"message": "Haven API"}
 
 @api_router.post("/auth/google")
 def auth_google(payload: GoogleAuthPayload, response: Response):
@@ -470,10 +476,9 @@ def get_profile(user: dict) -> dict:
             "hide_from_health_statuses": ""
         }
     profile_image = profile.get("profile_image", "")
-    if profile_image and not profile_image.startswith("data:"):
-        profile_image = get_proxied_image_url(profile_image)
+    profile_image = get_proxied_image_url(profile_image) if profile_image else user.get("picture","")
     gallery = profile.get("gallery_images") or []
-    gallery_proxied = [get_proxied_image_url(url) for url in gallery if url and not url.startswith("data:")]
+    gallery_proxied = [get_proxied_image_url(url) for url in gallery if url]
     return {
         "user_id": profile["user_id"], "email": user.get("email",""), "name": user.get("name",""),
         "date_of_birth": profile.get("date_of_birth"), "gender": profile.get("gender"),
@@ -486,7 +491,7 @@ def get_profile(user: dict) -> dict:
         "education": profile.get("education",""), "kids": profile.get("kids",""),
         "want_kids": profile.get("want_kids",""), "smoke": profile.get("smoke",""),
         "drink": profile.get("drink",""), "employment": profile.get("employment",""),
-        "profile_image": profile_image or user.get("picture",""),
+        "profile_image": profile_image,
         "gallery_images": gallery_proxied,
         "onboarding_complete": profile.get("onboarding_complete", False),
         "pref_gender": profile.get("pref_gender",""), "pref_min_age": profile.get("pref_min_age",18),
@@ -595,7 +600,7 @@ async def update_profile(payload: ProfileUpdatePayload, user: dict = Depends(get
 def get_my_profile(user: dict = Depends(get_current_user)):
     return get_profile(user)
 
-# ---------- Image Proxy ----------
+# ---------- Image Proxy (with permanent cache headers) ----------
 @api_router.get("/images/{user_id}/{filename:path}")
 async def serve_image(user_id: str, filename: str):
     path = f"{user_id}/{filename}"
@@ -751,26 +756,206 @@ def get_countries():
             return [{"code": c["cca2"], "name": c["name"]["common"]} for c in resp.json()]
     except: pass
     return [
-        {"code":"AF","name":"Afghanistan"},{"code":"AL","name":"Albania"},{"code":"DZ","name":"Algeria"},
-        {"code":"AR","name":"Argentina"},{"code":"AU","name":"Australia"},{"code":"AT","name":"Austria"},
-        {"code":"BD","name":"Bangladesh"},{"code":"BE","name":"Belgium"},{"code":"BR","name":"Brazil"},
-        {"code":"CA","name":"Canada"},{"code":"CN","name":"China"},{"code":"CO","name":"Colombia"},
-        {"code":"EG","name":"Egypt"},{"code":"FR","name":"France"},{"code":"DE","name":"Germany"},
-        {"code":"GH","name":"Ghana"},{"code":"GR","name":"Greece"},{"code":"IN","name":"India"},
-        {"code":"ID","name":"Indonesia"},{"code":"IR","name":"Iran"},{"code":"IE","name":"Ireland"},
-        {"code":"IL","name":"Israel"},{"code":"IT","name":"Italy"},{"code":"JP","name":"Japan"},
-        {"code":"KE","name":"Kenya"},{"code":"MY","name":"Malaysia"},{"code":"MX","name":"Mexico"},
-        {"code":"MA","name":"Morocco"},{"code":"NL","name":"Netherlands"},{"code":"NZ","name":"New Zealand"},
-        {"code":"NG","name":"Nigeria"},{"code":"PK","name":"Pakistan"},{"code":"PE","name":"Peru"},
-        {"code":"PH","name":"Philippines"},{"code":"PL","name":"Poland"},{"code":"PT","name":"Portugal"},
-        {"code":"RO","name":"Romania"},{"code":"RU","name":"Russia"},{"code":"SA","name":"Saudi Arabia"},
-        {"code":"SG","name":"Singapore"},{"code":"ZA","name":"South Africa"},{"code":"KR","name":"South Korea"},
-        {"code":"ES","name":"Spain"},{"code":"SE","name":"Sweden"},{"code":"CH","name":"Switzerland"},
-        {"code":"TZ","name":"Tanzania"},{"code":"TH","name":"Thailand"},{"code":"TR","name":"Turkey"},
-        {"code":"UG","name":"Uganda"},{"code":"UA","name":"Ukraine"},{"code":"AE","name":"UAE"},
-        {"code":"GB","name":"United Kingdom"},{"code":"US","name":"United States"},{"code":"VN","name":"Vietnam"},
-        {"code":"ZW","name":"Zimbabwe"}
-    ]
+{"code":"AF","name":"Afghanistan"},
+{"code":"AL","name":"Albania"},
+{"code":"DZ","name":"Algeria"},
+{"code":"AD","name":"Andorra"},
+{"code":"AO","name":"Angola"},
+{"code":"AG","name":"Antigua and Barbuda"},
+{"code":"AR","name":"Argentina"},
+{"code":"AM","name":"Armenia"},
+{"code":"AU","name":"Australia"},
+{"code":"AT","name":"Austria"},
+{"code":"AZ","name":"Azerbaijan"},
+{"code":"BS","name":"Bahamas"},
+{"code":"BH","name":"Bahrain"},
+{"code":"BD","name":"Bangladesh"},
+{"code":"BB","name":"Barbados"},
+{"code":"BY","name":"Belarus"},
+{"code":"BE","name":"Belgium"},
+{"code":"BZ","name":"Belize"},
+{"code":"BJ","name":"Benin"},
+{"code":"BT","name":"Bhutan"},
+{"code":"BO","name":"Bolivia"},
+{"code":"BA","name":"Bosnia and Herzegovina"},
+{"code":"BW","name":"Botswana"},
+{"code":"BR","name":"Brazil"},
+{"code":"BN","name":"Brunei"},
+{"code":"BG","name":"Bulgaria"},
+{"code":"BF","name":"Burkina Faso"},
+{"code":"BI","name":"Burundi"},
+{"code":"CV","name":"Cabo Verde"},
+{"code":"KH","name":"Cambodia"},
+{"code":"CM","name":"Cameroon"},
+{"code":"CA","name":"Canada"},
+{"code":"CF","name":"Central African Republic"},
+{"code":"TD","name":"Chad"},
+{"code":"CL","name":"Chile"},
+{"code":"CN","name":"China"},
+{"code":"CO","name":"Colombia"},
+{"code":"KM","name":"Comoros"},
+{"code":"CG","name":"Congo"},
+{"code":"CD","name":"Congo (Democratic Republic)"},
+{"code":"CR","name":"Costa Rica"},
+{"code":"CI","name":"Côte d’Ivoire"},
+{"code":"HR","name":"Croatia"},
+{"code":"CU","name":"Cuba"},
+{"code":"CY","name":"Cyprus"},
+{"code":"CZ","name":"Czechia"},
+{"code":"DK","name":"Denmark"},
+{"code":"DJ","name":"Djibouti"},
+{"code":"DM","name":"Dominica"},
+{"code":"DO","name":"Dominican Republic"},
+{"code":"EC","name":"Ecuador"},
+{"code":"EG","name":"Egypt"},
+{"code":"SV","name":"El Salvador"},
+{"code":"GQ","name":"Equatorial Guinea"},
+{"code":"ER","name":"Eritrea"},
+{"code":"EE","name":"Estonia"},
+{"code":"SZ","name":"Eswatini"},
+{"code":"ET","name":"Ethiopia"},
+{"code":"FJ","name":"Fiji"},
+{"code":"FI","name":"Finland"},
+{"code":"FR","name":"France"},
+{"code":"GA","name":"Gabon"},
+{"code":"GM","name":"Gambia"},
+{"code":"GE","name":"Georgia"},
+{"code":"DE","name":"Germany"},
+{"code":"GH","name":"Ghana"},
+{"code":"GR","name":"Greece"},
+{"code":"GD","name":"Grenada"},
+{"code":"GT","name":"Guatemala"},
+{"code":"GN","name":"Guinea"},
+{"code":"GW","name":"Guinea-Bissau"},
+{"code":"GY","name":"Guyana"},
+{"code":"HT","name":"Haiti"},
+{"code":"HN","name":"Honduras"},
+{"code":"HU","name":"Hungary"},
+{"code":"IS","name":"Iceland"},
+{"code":"IN","name":"India"},
+{"code":"ID","name":"Indonesia"},
+{"code":"IR","name":"Iran"},
+{"code":"IQ","name":"Iraq"},
+{"code":"IE","name":"Ireland"},
+{"code":"IL","name":"Israel"},
+{"code":"IT","name":"Italy"},
+{"code":"JM","name":"Jamaica"},
+{"code":"JP","name":"Japan"},
+{"code":"JO","name":"Jordan"},
+{"code":"KZ","name":"Kazakhstan"},
+{"code":"KE","name":"Kenya"},
+{"code":"KI","name":"Kiribati"},
+{"code":"XK","name":"Kosovo"},
+{"code":"KW","name":"Kuwait"},
+{"code":"KG","name":"Kyrgyzstan"},
+{"code":"LA","name":"Laos"},
+{"code":"LV","name":"Latvia"},
+{"code":"LB","name":"Lebanon"},
+{"code":"LS","name":"Lesotho"},
+{"code":"LR","name":"Liberia"},
+{"code":"LY","name":"Libya"},
+{"code":"LI","name":"Liechtenstein"},
+{"code":"LT","name":"Lithuania"},
+{"code":"LU","name":"Luxembourg"},
+{"code":"MG","name":"Madagascar"},
+{"code":"MW","name":"Malawi"},
+{"code":"MY","name":"Malaysia"},
+{"code":"MV","name":"Maldives"},
+{"code":"ML","name":"Mali"},
+{"code":"MT","name":"Malta"},
+{"code":"MH","name":"Marshall Islands"},
+{"code":"MR","name":"Mauritania"},
+{"code":"MU","name":"Mauritius"},
+{"code":"MX","name":"Mexico"},
+{"code":"FM","name":"Micronesia"},
+{"code":"MD","name":"Moldova"},
+{"code":"MC","name":"Monaco"},
+{"code":"MN","name":"Mongolia"},
+{"code":"ME","name":"Montenegro"},
+{"code":"MA","name":"Morocco"},
+{"code":"MZ","name":"Mozambique"},
+{"code":"MM","name":"Myanmar"},
+{"code":"NA","name":"Namibia"},
+{"code":"NR","name":"Nauru"},
+{"code":"NP","name":"Nepal"},
+{"code":"NL","name":"Netherlands"},
+{"code":"NZ","name":"New Zealand"},
+{"code":"NI","name":"Nicaragua"},
+{"code":"NE","name":"Niger"},
+{"code":"NG","name":"Nigeria"},
+{"code":"KP","name":"North Korea"},
+{"code":"MK","name":"North Macedonia"},
+{"code":"NO","name":"Norway"},
+{"code":"OM","name":"Oman"},
+{"code":"PK","name":"Pakistan"},
+{"code":"PS","name":"Palestine"},
+{"code":"PW","name":"Palau"},
+{"code":"PA","name":"Panama"},
+{"code":"PG","name":"Papua New Guinea"},
+{"code":"PY","name":"Paraguay"},
+{"code":"PE","name":"Peru"},
+{"code":"PH","name":"Philippines"},
+{"code":"PL","name":"Poland"},
+{"code":"PT","name":"Portugal"},
+{"code":"QA","name":"Qatar"},
+{"code":"RO","name":"Romania"},
+{"code":"RU","name":"Russia"},
+{"code":"RW","name":"Rwanda"},
+{"code":"KN","name":"Saint Kitts and Nevis"},
+{"code":"LC","name":"Saint Lucia"},
+{"code":"VC","name":"Saint Vincent and the Grenadines"},
+{"code":"WS","name":"Samoa"},
+{"code":"SM","name":"San Marino"},
+{"code":"ST","name":"Sao Tome and Principe"},
+{"code":"SA","name":"Saudi Arabia"},
+{"code":"SN","name":"Senegal"},
+{"code":"RS","name":"Serbia"},
+{"code":"SC","name":"Seychelles"},
+{"code":"SL","name":"Sierra Leone"},
+{"code":"SG","name":"Singapore"},
+{"code":"SK","name":"Slovakia"},
+{"code":"SI","name":"Slovenia"},
+{"code":"SB","name":"Solomon Islands"},
+{"code":"SO","name":"Somalia"},
+{"code":"ZA","name":"South Africa"},
+{"code":"SS","name":"South Sudan"},
+{"code":"ES","name":"Spain"},
+{"code":"LK","name":"Sri Lanka"},
+{"code":"SD","name":"Sudan"},
+{"code":"SR","name":"Suriname"},
+{"code":"SE","name":"Sweden"},
+{"code":"CH","name":"Switzerland"},
+{"code":"SY","name":"Syria"},
+{"code":"TW","name":"Taiwan"},
+{"code":"TJ","name":"Tajikistan"},
+{"code":"TZ","name":"Tanzania"},
+{"code":"TH","name":"Thailand"},
+{"code":"TL","name":"Timor-Leste"},
+{"code":"TG","name":"Togo"},
+{"code":"TO","name":"Tonga"},
+{"code":"TT","name":"Trinidad and Tobago"},
+{"code":"TN","name":"Tunisia"},
+{"code":"TR","name":"Turkey"},
+{"code":"TM","name":"Turkmenistan"},
+{"code":"TV","name":"Tuvalu"},
+{"code":"UG","name":"Uganda"},
+{"code":"UA","name":"Ukraine"},
+{"code":"AE","name":"United Arab Emirates"},
+{"code":"GB","name":"United Kingdom"},
+{"code":"US","name":"United States"},
+{"code":"UY","name":"Uruguay"},
+{"code":"UZ","name":"Uzbekistan"},
+{"code":"VU","name":"Vanuatu"},
+{"code":"VA","name":"Vatican City"},
+{"code":"VE","name":"Venezuela"},
+{"code":"VN","name":"Vietnam"},
+{"code":"YE","name":"Yemen"},
+{"code":"ZM","name":"Zambia"},
+{"code":"ZW","name":"Zimbabwe"}
+]
+
+
+
 
 @api_router.get("/location/cities")
 def get_cities(country: str):
