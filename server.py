@@ -34,6 +34,7 @@ DEFAULT_VOTE_COST_SOL = 0.001
 EARTH_RADIUS_KM = 6371
 STORAGE_BUCKET = "avatars"
 IMAGE_URL_PREFIX = f"{SUPABASE_URL}/storage/v1/object/public/{STORAGE_BUCKET}"
+MAX_GPS_AGE_HOURS = 24  # GPS location expires after 24 hours
 
 PREMIUM_TIERS = {
     "silver": {"diamond_cost": 45, "duration_days": 30, "label": "Silver"},
@@ -55,6 +56,26 @@ SYSTEM_IMAGES = [
     "https://images.unsplash.com/photo-1604871000636-074fa5117945?auto=format&fit=crop&w=800&q=80",
     "https://images.unsplash.com/photo-1614850523459-c2f4c699c52e?auto=format&fit=crop&w=800&q=80",
 ]
+
+# ---------- IP Geolocation Helper ----------
+async def get_location_from_ip(ip: str) -> tuple:
+    """Get approximate location from IP address as fallback"""
+    try:
+        async with httpx.AsyncClient(timeout=5) as client:
+            resp = await client.get(f"http://ip-api.com/json/{ip}?fields=status,lat,lon,country,city")
+            if resp.status_code == 200:
+                data = resp.json()
+                if data.get('status') == 'success':
+                    return {
+                        'latitude': data.get('lat'),
+                        'longitude': data.get('lon'),
+                        'country': data.get('country'),
+                        'city': data.get('city'),
+                        'source': 'ip'
+                    }
+    except Exception as e:
+        logger.error(f"IP geolocation failed: {e}")
+    return None
 
 # ---------- Helpers ----------
 def _parse_dt(value):
@@ -80,39 +101,23 @@ def haversine(lat1, lon1, lat2, lon2):
     a = math.sin(dlat/2)**2 + math.cos(math.radians(lat1)) * math.cos(math.radians(lat2)) * math.sin(dlon/2)**2
     return round(EARTH_RADIUS_KM * 2 * math.atan2(math.sqrt(a), math.sqrt(1-a)), 1)
 
-def geocode_country(country: str):
+def reverse_geocode(lat: float, lon: float) -> tuple:
+    """Get country and city from GPS coordinates"""
     try:
-        resp = httpx.get("https://nominatim.openstreetmap.org/search", params={
-            "q": country, "format": "json", "limit": 1
-        }, headers={"User-Agent": "HavenApp/1.0"}, timeout=5)
-        if resp.status_code == 200 and resp.json():
-            data = resp.json()[0]
-            return float(data["lat"]), float(data["lon"])
-    except: pass
-    country_coords = {
-        "South Africa": (-30.5595, 22.9375),
-        "United States": (37.0902, -95.7129),
-        "United Kingdom": (55.3781, -3.4360),
-        "Canada": (56.1304, -106.3468),
-        "Australia": (-25.2744, 133.7751),
-        "India": (20.5937, 78.9629),
-        "Nigeria": (9.0820, 8.6753),
-        "Kenya": (-0.0236, 37.9062),
-        "Ghana": (7.9465, -1.0232),
-        "Zimbabwe": (-19.0154, 29.1549),
-    }
-    return country_coords.get(country, (None, None))
-
-def geocode_city(city: str, country: str):
-    try:
-        query = f"{city}, {country}"
-        resp = httpx.get("https://nominatim.openstreetmap.org/search", params={
-            "q": query, "format": "json", "limit": 1
-        }, headers={"User-Agent": "HavenApp/1.0"}, timeout=5)
-        if resp.status_code == 200 and resp.json():
-            data = resp.json()[0]
-            return float(data["lat"]), float(data["lon"])
-    except: pass
+        resp = httpx.get(
+            f"https://nominatim.openstreetmap.org/reverse",
+            params={"lat": lat, "lon": lon, "format": "json"},
+            headers={"User-Agent": "HavenApp/1.0"},
+            timeout=5
+        )
+        if resp.status_code == 200:
+            data = resp.json()
+            if data.get("address"):
+                country = data["address"].get("country")
+                city = data["address"].get("city") or data["address"].get("town") or data["address"].get("village")
+                return country, city
+    except Exception as e:
+        logger.error(f"Reverse geocoding failed: {e}")
     return None, None
 
 # ---------- Image Helpers ----------
@@ -159,24 +164,23 @@ def process_image_field(image_value: str, user_id: str, filename_prefix: str) ->
     return image_value
 
 def get_proxied_image_url(supabase_url: str) -> str:
-    """Convert stored URL to an absolute public URL, ready for the frontend."""
     if not supabase_url:
         return supabase_url
-
-    # Already a full HTTP URL → return as is (Supabase public URL or backend proxy)
     if supabase_url.startswith("http"):
         return supabase_url
-
-    # If it's a relative proxy path, use BACKEND_PUBLIC_URL to make it absolute
     if supabase_url.startswith("/api/images/"):
         backend_url = os.environ.get("BACKEND_PUBLIC_URL", "").rstrip("/")
         if backend_url:
             return f"{backend_url}{supabase_url}"
         return supabase_url
-
     return supabase_url
 
 # ---------- Models ----------
+class LocationUpdatePayload(BaseModel):
+    latitude: float
+    longitude: float
+    accuracy: Optional[float] = None
+
 class CardCreate(BaseModel):
     image_url: str
     smart_link: Optional[str] = ""
@@ -197,8 +201,7 @@ class PayfastInitiatePayload(BaseModel):
     return_url: str; cancel_url: str
 
 class ProfileSetupPayload(BaseModel):
-    date_of_birth: str; gender: str; country: str; city: str; health_status: str
-    latitude: Optional[float] = None; longitude: Optional[float] = None
+    date_of_birth: str; gender: str; health_status: str
     display_name: Optional[str] = ""; bio: Optional[str] = ""
     interests: Optional[str] = ""; looking_for: Optional[str] = ""
     education: Optional[str] = ""; kids: Optional[str] = ""
@@ -214,9 +217,7 @@ class ProfileSetupPayload(BaseModel):
 
 class ProfileUpdatePayload(BaseModel):
     date_of_birth: Optional[str] = None; gender: Optional[str] = None
-    country: Optional[str] = None; city: Optional[str] = None
     health_status: Optional[str] = None
-    latitude: Optional[float] = None; longitude: Optional[float] = None
     display_name: Optional[str] = None; bio: Optional[str] = None
     interests: Optional[str] = None; looking_for: Optional[str] = None
     education: Optional[str] = None; kids: Optional[str] = None
@@ -260,6 +261,7 @@ def get_current_user(
     check_service_fee(user)
     check_premium_status(user)
     return user
+
 @app.get("/")
 def root():
     return {"message": "Haven API is running"}
@@ -268,8 +270,6 @@ def root():
 def api_root():
     return {"message": "Haven API"}
 
-
-    
 @api_router.post("/auth/google")
 def auth_google(payload: GoogleAuthPayload, response: Response):
     email, name, picture, ref = payload.email, payload.name, payload.picture, payload.ref
@@ -306,8 +306,18 @@ def auth_google(payload: GoogleAuthPayload, response: Response):
 def auth_me(user: dict = Depends(get_current_user)):
     check_service_fee(user)
     check_premium_status(user)
-    profile = _maybe(sb.table("user_profiles").select("onboarding_complete").eq("user_id", user["user_id"]).maybe_single().execute())
+    profile = _maybe(sb.table("user_profiles").select("*").eq("user_id", user["user_id"]).maybe_single().execute())
     onboarding_complete = profile.get("onboarding_complete", False) if profile else False
+    notif_count = sb.table("notifications").select("notification_id", count="exact").eq("user_id", user["user_id"]).eq("read", False).execute()
+    unread = notif_count.count if hasattr(notif_count, 'count') else 0
+    
+    # Check if GPS location exists and is not stale
+    has_gps = profile and profile.get("gps_latitude") is not None if profile else False
+    gps_stale = False
+    if has_gps and profile.get("gps_verified_at"):
+        gps_age = datetime.now(timezone.utc) - _parse_dt(profile["gps_verified_at"])
+        gps_stale = gps_age > timedelta(hours=MAX_GPS_AGE_HOURS)
+    
     return {
         "user_id": user["user_id"], "email": user["email"], "name": user["name"],
         "picture": user.get("picture", ""), "ad_tokens": user.get("ad_tokens", 0),
@@ -323,6 +333,10 @@ def auth_me(user: dict = Depends(get_current_user)):
         "onboarding_complete": onboarding_complete,
         "premium_tier": user.get("premium_tier", "free"),
         "premium_expires_at": user.get("premium_expires_at"),
+        "unread_notifications": unread,
+        "has_gps": has_gps,
+        "gps_stale": gps_stale,
+        "needs_location": not has_gps or gps_stale,  # Frontend should prompt for location
     }
 
 @api_router.post("/auth/logout")
@@ -352,6 +366,108 @@ def check_premium_status(user: dict):
             sb.table("users").update({"premium_tier": "free", "premium_expires_at": None}).eq("user_id", user["user_id"]).execute()
             user["premium_tier"] = "free"
             user["premium_expires_at"] = None
+
+# ---------- Location API (GPS ONLY - No Manual Location) ----------
+@api_router.post("/location/update")
+async def update_location(payload: LocationUpdatePayload, user: dict = Depends(get_current_user)):
+    """Update user's GPS location. This is the ONLY way to set location."""
+    if not (-90 <= payload.latitude <= 90) or not (-180 <= payload.longitude <= 180):
+        raise HTTPException(400, "Invalid coordinates")
+    
+    # Validate accuracy (GPS should be within 100 meters for good location)
+    if payload.accuracy and payload.accuracy > 500:
+        raise HTTPException(400, "Location accuracy too low ( >500m). Please enable GPS and try again.")
+    
+    now = datetime.now(timezone.utc)
+    
+    # Get country and city from GPS coordinates
+    country, city = reverse_geocode(payload.latitude, payload.longitude)
+    
+    # Update profile with GPS location (overwrites any manual location)
+    profile_data = {
+        "gps_latitude": payload.latitude,
+        "gps_longitude": payload.longitude,
+        "gps_verified_at": now.isoformat(),
+        "gps_accuracy": payload.accuracy,
+        "location_source": "gps",
+        "latitude": payload.latitude,  # Also update the main location fields
+        "longitude": payload.longitude,
+        "country": country,
+        "city": city or "",
+        "updated_at": now.isoformat(),
+    }
+    
+    existing = _maybe(sb.table("user_profiles").select("user_id").eq("user_id", user["user_id"]).maybe_single().execute())
+    if existing:
+        sb.table("user_profiles").update(profile_data).eq("user_id", user["user_id"]).execute()
+    else:
+        profile_data["user_id"] = user["user_id"]
+        profile_data["created_at"] = now.isoformat()
+        sb.table("user_profiles").insert(profile_data).execute()
+    
+    return {
+        "ok": True, 
+        "message": "GPS location updated", 
+        "latitude": payload.latitude, 
+        "longitude": payload.longitude,
+        "country": country,
+        "city": city,
+    }
+
+@api_router.get("/location/ip-fallback")
+async def ip_fallback(request: Request, user: dict = Depends(get_current_user)):
+    """Get approximate location from IP address (fallback when GPS unavailable)"""
+    client_ip = request.headers.get("x-forwarded-for", request.client.host).split(",")[0].strip()
+    location = await get_location_from_ip(client_ip)
+    if location:
+        now = datetime.now(timezone.utc)
+        # Update profile with IP location
+        profile_data = {
+            "gps_latitude": location['latitude'],
+            "gps_longitude": location['longitude'],
+            "gps_verified_at": now.isoformat(),
+            "location_source": "ip",
+            "latitude": location['latitude'],
+            "longitude": location['longitude'],
+            "country": location.get('country', ''),
+            "city": location.get('city', ''),
+            "updated_at": now.isoformat(),
+        }
+        existing = _maybe(sb.table("user_profiles").select("user_id").eq("user_id", user["user_id"]).maybe_single().execute())
+        if existing:
+            sb.table("user_profiles").update(profile_data).eq("user_id", user["user_id"]).execute()
+        else:
+            profile_data["user_id"] = user["user_id"]
+            sb.table("user_profiles").insert(profile_data).execute()
+        return {
+            "ok": True, 
+            "latitude": location['latitude'], 
+            "longitude": location['longitude'],
+            "country": location.get('country'),
+            "city": location.get('city'),
+            "source": "ip"
+        }
+    return {"ok": False, "message": "Could not determine location from IP"}
+
+@api_router.get("/location/status")
+def get_location_status(user: dict = Depends(get_current_user)):
+    """Check if user has valid GPS location"""
+    profile = _maybe(sb.table("user_profiles").select("gps_latitude,gps_longitude,gps_verified_at,location_source").eq("user_id", user["user_id"]).maybe_single().execute())
+    
+    if not profile or profile.get("gps_latitude") is None:
+        return {"has_location": False, "needs_location": True, "message": "No GPS location set"}
+    
+    gps_age = datetime.now(timezone.utc) - _parse_dt(profile["gps_verified_at"])
+    is_stale = gps_age > timedelta(hours=MAX_GPS_AGE_HOURS)
+    
+    return {
+        "has_location": True,
+        "needs_location": is_stale,
+        "is_stale": is_stale,
+        "location_source": profile.get("location_source", "unknown"),
+        "last_updated": profile.get("gps_verified_at"),
+        "message": "GPS location expired - please refresh" if is_stale else "GPS location valid"
+    }
 
 # ---------- Wallet & Upgrade ----------
 @api_router.post("/wallet/connect")
@@ -464,7 +580,7 @@ def referral_me(user: dict = Depends(get_current_user)):
 def image_library(user: dict = Depends(get_current_user)):
     return {"images": SYSTEM_IMAGES}
 
-# ---------- Profile ----------
+# ---------- Profile (GPS Only - No Manual Country/City) ----------
 def get_profile(user: dict) -> dict:
     profile = _maybe(sb.table("user_profiles").select("*").eq("user_id", user["user_id"]).maybe_single().execute())
     if not profile:
@@ -479,18 +595,28 @@ def get_profile(user: dict) -> dict:
             "pref_gender": "", "pref_min_age": 18, "pref_max_age": 99,
             "pref_country": "", "pref_max_distance": 50, "pref_health_status": "",
             "profile_hidden": False, "hide_from_min_age": None, "hide_from_max_age": None,
-            "hide_from_health_statuses": ""
+            "hide_from_health_statuses": "",
+            "gps_latitude": None, "gps_longitude": None, "gps_verified_at": None,
+            "location_source": "none",
         }
+    
+    # Use GPS location (ignore any manually entered location)
+    lat = profile.get("gps_latitude")
+    lon = profile.get("gps_longitude")
+    country = profile.get("country") if lat is not None else None
+    city = profile.get("city") if lat is not None else None
+    
     profile_image = profile.get("profile_image", "")
     profile_image = get_proxied_image_url(profile_image) if profile_image else user.get("picture","")
     gallery = profile.get("gallery_images") or []
     gallery_proxied = [get_proxied_image_url(url) for url in gallery if url]
+    
     return {
         "user_id": profile["user_id"], "email": user.get("email",""), "name": user.get("name",""),
         "date_of_birth": profile.get("date_of_birth"), "gender": profile.get("gender"),
-        "country": profile.get("country"), "city": profile.get("city"),
+        "country": country, "city": city,
         "health_status": profile.get("health_status"),
-        "latitude": profile.get("latitude"), "longitude": profile.get("longitude"),
+        "latitude": lat, "longitude": lon,
         "display_name": profile.get("display_name", user.get("name","")),
         "bio": profile.get("bio",""), "interests": profile.get("interests",""),
         "looking_for": profile.get("looking_for",""),
@@ -509,26 +635,32 @@ def get_profile(user: dict) -> dict:
         "hide_from_max_age": profile.get("hide_from_max_age"),
         "hide_from_health_statuses": profile.get("hide_from_health_statuses",""),
         "premium_tier": user.get("premium_tier", "free"),
+        "gps_latitude": profile.get("gps_latitude"),
+        "gps_longitude": profile.get("gps_longitude"),
+        "gps_verified_at": profile.get("gps_verified_at"),
+        "location_source": profile.get("location_source", "none"),
     }
 
 @api_router.post("/profile/setup")
 def setup_profile(payload: ProfileSetupPayload, user: dict = Depends(get_current_user)):
-    lat, lon = payload.latitude, payload.longitude
-    if (lat is None or lon is None) and payload.city and payload.country:
-        lat, lon = geocode_city(payload.city, payload.country)
-        if lat is None or lon is None:
-            lat, lon = geocode_country(payload.country)
-    elif (lat is None or lon is None) and payload.country:
-        lat, lon = geocode_country(payload.country)
+    # Get existing profile to preserve GPS data
+    existing_profile = _maybe(sb.table("user_profiles").select("*").eq("user_id", user["user_id"]).maybe_single().execute())
+    
+    # Use existing GPS location if available
+    lat = existing_profile.get("gps_latitude") if existing_profile else None
+    lon = existing_profile.get("gps_longitude") if existing_profile else None
+    country = existing_profile.get("country") if existing_profile and lat else None
+    city = existing_profile.get("city") if existing_profile and lat else None
+    
     profile_image = process_image_field(payload.profile_image, user["user_id"], "profile")
     gallery = []
     for i, img in enumerate(payload.gallery_images or []):
         gallery.append(process_image_field(img, user["user_id"], f"gallery_{i}"))
-    existing = _maybe(sb.table("user_profiles").select("*").eq("user_id", user["user_id"]).maybe_single().execute())
+    
     profile_data = {
         "user_id": user["user_id"],
         "date_of_birth": payload.date_of_birth, "gender": payload.gender,
-        "country": payload.country, "city": payload.city,
+        "country": country, "city": city,
         "health_status": payload.health_status,
         "latitude": lat, "longitude": lon,
         "display_name": payload.display_name or user.get("name",""),
@@ -550,19 +682,27 @@ def setup_profile(payload: ProfileSetupPayload, user: dict = Depends(get_current
         "onboarding_complete": True,
         "updated_at": datetime.now(timezone.utc).isoformat(),
     }
-    if existing:
+    
+    # Preserve GPS data if it exists
+    if existing_profile:
+        if existing_profile.get("gps_latitude"):
+            profile_data["gps_latitude"] = existing_profile["gps_latitude"]
+            profile_data["gps_longitude"] = existing_profile["gps_longitude"]
+            profile_data["gps_verified_at"] = existing_profile["gps_verified_at"]
+            profile_data["location_source"] = existing_profile.get("location_source", "none")
         sb.table("user_profiles").update(profile_data).eq("user_id", user["user_id"]).execute()
     else:
         profile_data["created_at"] = datetime.now(timezone.utc).isoformat()
         sb.table("user_profiles").insert(profile_data).execute()
+    
     return {"ok": True, "profile": get_profile(user)}
 
 @api_router.put("/profile")
 async def update_profile(payload: ProfileUpdatePayload, user: dict = Depends(get_current_user)):
     updates = {}
     all_fields = [
-        "date_of_birth", "gender", "country", "city", "health_status",
-        "latitude", "longitude", "display_name", "bio", "interests", "looking_for",
+        "date_of_birth", "gender", "health_status",
+        "display_name", "bio", "interests", "looking_for",
         "education", "kids", "want_kids", "smoke", "drink", "employment",
         "pref_gender", "pref_min_age", "pref_max_age", "pref_country",
         "pref_max_distance", "pref_health_status",
@@ -571,6 +711,10 @@ async def update_profile(payload: ProfileUpdatePayload, user: dict = Depends(get
     for field in all_fields:
         value = getattr(payload, field, None)
         if value is not None: updates[field] = value
+    
+    # NEVER allow manual location updates - GPS only!
+    # If frontend sends latitude/longitude, ignore them
+    
     if payload.profile_image is not None:
         updates["profile_image"] = process_image_field(payload.profile_image, user["user_id"], "profile")
     if payload.gallery_images is not None:
@@ -578,20 +722,9 @@ async def update_profile(payload: ProfileUpdatePayload, user: dict = Depends(get
         for i, img in enumerate(payload.gallery_images):
             new_gallery.append(process_image_field(img, user["user_id"], f"gallery_{i}"))
         updates["gallery_images"] = new_gallery
+    
     if not updates: return {"ok": True, "profile": get_profile(user)}
-    if ("city" in updates or "country" in updates) and "latitude" not in updates:
-        city = updates.get("city", (await get_profile(user))["city"])
-        country = updates.get("country", (await get_profile(user))["country"])
-        if city and country:
-            lat, lon = geocode_city(city, country)
-            if lat is not None and lon is not None:
-                updates["latitude"] = lat
-                updates["longitude"] = lon
-        elif country:
-            lat, lon = geocode_country(country)
-            if lat is not None and lon is not None:
-                updates["latitude"] = lat
-                updates["longitude"] = lon
+    
     updates["updated_at"] = datetime.now(timezone.utc).isoformat()
     existing = _maybe(sb.table("user_profiles").select("user_id").eq("user_id", user["user_id"]).maybe_single().execute())
     if existing:
@@ -606,13 +739,9 @@ async def update_profile(payload: ProfileUpdatePayload, user: dict = Depends(get
 def get_my_profile(user: dict = Depends(get_current_user)):
     return get_profile(user)
 
-# ---------- Image Proxy (with permanent cache headers) ----------
+# ---------- Image Proxy ----------
 @api_router.get("/images/{user_id}/{filename:path}")
 async def serve_image(user_id: str, filename: str):
-    """Serve compressed images from Supabase Storage without authentication.
-       The bucket is private, and the image URLs are only embedded in
-       profile responses that already require authentication.
-    """
     path = f"{user_id}/{filename}"
     try:
         file_data = sb.storage.from_(STORAGE_BUCKET).download(path)
@@ -628,29 +757,41 @@ async def serve_image(user_id: str, filename: str):
         logger.error(f"Image proxy error: {e}")
         raise HTTPException(status_code=404, detail="Image not found")
 
-# ---------- Discovery ----------
+# ---------- Discovery (GPS-based distance only) ----------
 @api_router.get("/discover/profiles")
 def get_discover_profiles(user: dict = Depends(get_current_user)):
     viewer_profile = _maybe(sb.table("user_profiles").select("*").eq("user_id", user["user_id"]).maybe_single().execute())
     if not viewer_profile: return []
+    
+    # Use GPS coordinates only
+    my_lat = viewer_profile.get("gps_latitude") or viewer_profile.get("latitude")
+    my_lon = viewer_profile.get("gps_longitude") or viewer_profile.get("longitude")
+    
+    # If no GPS location, return empty list (user must set location first)
+    if my_lat is None or my_lon is None:
+        return []
+    
     pref_gender = viewer_profile.get("pref_gender","")
     pref_min_age = viewer_profile.get("pref_min_age",18)
     pref_max_age = viewer_profile.get("pref_max_age",99)
     pref_country = viewer_profile.get("pref_country","")
     pref_max_distance = viewer_profile.get("pref_max_distance",50)
     pref_health_status = viewer_profile.get("pref_health_status","")
-    my_lat = viewer_profile.get("latitude")
-    my_lon = viewer_profile.get("longitude")
+    
     today = datetime.now(timezone.utc).date()
     matches = sb.table("profile_matches").select("*").or_(f"user1_id.eq.{user['user_id']},user2_id.eq.{user['user_id']}").execute()
     matched_ids = set()
     for m in (matches.data or []):
         partner = m["user2_id"] if m["user1_id"] == user["user_id"] else m["user1_id"]
         matched_ids.add(partner)
+    
     query = sb.table("user_profiles").select("*").neq("user_id", user["user_id"]).eq("onboarding_complete", True)
+    # Only show users who have GPS location
+    query = query.not_.is_("gps_latitude", "null")
     for mid in matched_ids:
         query = query.neq("user_id", mid)
     profiles = (query.limit(200).execute()).data or []
+    
     filtered = []
     for p in profiles:
         if p.get("profile_hidden"): continue
@@ -677,24 +818,23 @@ def get_discover_profiles(user: dict = Depends(get_current_user)):
         if age is not None and (age < pref_min_age or age > pref_max_age): continue
         if pref_health_status and p.get("health_status") != pref_health_status: continue
         if pref_country and p.get("country") != pref_country: continue
+        
+        # Calculate distance using GPS
+        p_lat = p.get("gps_latitude")
+        p_lon = p.get("gps_longitude")
         distance = None
-        if my_lat is not None and my_lon is not None:
-            p_lat = p.get("latitude")
-            p_lon = p.get("longitude")
-            if p_lat is not None and p_lon is not None:
-                distance = haversine(my_lat, my_lon, p_lat, p_lon)
-                if pref_max_distance and distance > pref_max_distance: continue
-            elif p.get("country"):
-                flat, flon = geocode_country(p["country"])
-                if flat is not None and flon is not None:
-                    distance = haversine(my_lat, my_lon, flat, flon)
-                    if pref_max_distance and distance > pref_max_distance: continue
+        if p_lat is not None and p_lon is not None:
+            distance = haversine(my_lat, my_lon, p_lat, p_lon)
+            if pref_max_distance and distance > pref_max_distance:
+                continue
+        
         p["distance_km"] = round(distance, 1) if distance is not None else None
         p["age"] = age
         p["profile_image"] = get_proxied_image_url(p.get("profile_image",""))
         gallery = p.get("gallery_images") or []
         p["gallery_images"] = [get_proxied_image_url(url) for url in gallery if url]
         filtered.append(p)
+    
     random.shuffle(filtered)
     return filtered[:50]
 
@@ -734,8 +874,19 @@ def send_match_message(match_id: str, payload: MatchMessagePayload, user: dict =
     if user["user_id"] not in [match["user1_id"], match["user2_id"]]: raise HTTPException(403)
     msg = {"message_id": f"msg_{uuid.uuid4().hex[:12]}", "match_id": match_id, "sender_id": user["user_id"], "content": payload.content, "read": False, "created_at": datetime.now(timezone.utc).isoformat()}
     sb.table("match_messages").insert(msg).execute()
+    other_id = match["user2_id"] if match["user1_id"] == user["user_id"] else match["user1_id"]
+    from_profile = get_profile(user)
+    sb.table("notifications").insert({
+        "notification_id": f"notif_{uuid.uuid4().hex[:12]}",
+        "user_id": other_id,
+        "from_user_id": user["user_id"],
+        "type": "match_message",
+        "message": f"New message from {from_profile.get('display_name', 'Someone')}",
+        "created_at": datetime.now(timezone.utc).isoformat()
+    }).execute()
     return {"ok": True, "message": msg}
 
+# ---------- Swipe ----------
 @api_router.post("/discover/swipe")
 def swipe_profile(payload: SwipePayload, user: dict = Depends(get_current_user)):
     if payload.direction not in ["like","pass"]: raise HTTPException(400)
@@ -745,230 +896,170 @@ def swipe_profile(payload: SwipePayload, user: dict = Depends(get_current_user))
     if not existing:
         sb.table("profile_swipes").insert({"swipe_id": f"swp_{uuid.uuid4().hex[:12]}", "swiper_id": user["user_id"], "swiped_id": payload.swiped_id, "direction": payload.direction, "swipe_type": payload.swipe_type}).execute()
     matched = False; match_id = None
+    
     if payload.direction == "like":
+        from_profile = get_profile(user)
+        if payload.swipe_type == "dating":
+            existing_req = _maybe(sb.table("dating_requests").select("*").eq("from_user_id", user["user_id"]).eq("to_user_id", payload.swiped_id).maybe_single().execute())
+            if not existing_req:
+                sb.table("dating_requests").insert({"request_id": f"dr_{uuid.uuid4().hex[:12]}", "from_user_id": user["user_id"], "to_user_id": payload.swiped_id, "created_at": datetime.now(timezone.utc).isoformat()}).execute()
+                sb.table("notifications").insert({
+                    "notification_id": f"notif_{uuid.uuid4().hex[:12]}",
+                    "user_id": payload.swiped_id,
+                    "from_user_id": user["user_id"],
+                    "type": "dating_request",
+                    "message": f"{from_profile.get('display_name', 'Someone')} sent you a dating request",
+                    "created_at": datetime.now(timezone.utc).isoformat()
+                }).execute()
+        elif payload.swipe_type == "friendship":
+            existing_req = _maybe(sb.table("friend_requests").select("*").eq("from_user_id", user["user_id"]).eq("to_user_id", payload.swiped_id).maybe_single().execute())
+            if not existing_req:
+                sb.table("friend_requests").insert({"request_id": f"fr_{uuid.uuid4().hex[:12]}", "from_user_id": user["user_id"], "to_user_id": payload.swiped_id, "created_at": datetime.now(timezone.utc).isoformat()}).execute()
+                sb.table("notifications").insert({
+                    "notification_id": f"notif_{uuid.uuid4().hex[:12]}",
+                    "user_id": payload.swiped_id,
+                    "from_user_id": user["user_id"],
+                    "type": "friend_request",
+                    "message": f"{from_profile.get('display_name', 'Someone')} sent you a friend request",
+                    "created_at": datetime.now(timezone.utc).isoformat()
+                }).execute()
+
         other = _maybe(sb.table("profile_swipes").select("*").eq("swiper_id", payload.swiped_id).eq("swiped_id", user["user_id"]).eq("direction","like").eq("swipe_type", payload.swipe_type).maybe_single().execute())
         if other:
             uid1, uid2 = sorted([user["user_id"], payload.swiped_id])
             exist_match = _maybe(sb.table("profile_matches").select("*").eq("user1_id", uid1).eq("user2_id", uid2).eq("swipe_type", payload.swipe_type).maybe_single().execute())
             if not exist_match:
                 match_id = f"match_{uuid.uuid4().hex[:12]}"
-                sb.table("profile_matches").insert({"match_id": match_id, "user1_id": uid1, "user2_id": uid2, "swipe_type": payload.swipe_type}).execute()
+                sb.table("profile_matches").insert({"match_id": match_id, "user1_id": uid1, "user2_id": uid2, "swipe_type": payload.swipe_type, "created_at": datetime.now(timezone.utc).isoformat()}).execute()
                 matched = True
+                sb.table("notifications").insert({
+                    "notification_id": f"notif_{uuid.uuid4().hex[:12]}",
+                    "user_id": payload.swiped_id,
+                    "from_user_id": user["user_id"],
+                    "type": "match_new",
+                    "message": f"You matched with {from_profile.get('display_name', 'Someone')}!",
+                    "created_at": datetime.now(timezone.utc).isoformat()
+                }).execute()
+                sb.table("notifications").insert({
+                    "notification_id": f"notif_{uuid.uuid4().hex[:12]}",
+                    "user_id": user["user_id"],
+                    "from_user_id": payload.swiped_id,
+                    "type": "match_new",
+                    "message": f"You matched with {from_profile.get('display_name', 'Someone')}!",
+                    "created_at": datetime.now(timezone.utc).isoformat()
+                }).execute()
             else: match_id = exist_match["match_id"]
+    
     return {"ok": True, "matched": matched, "match_id": match_id, "direction": payload.direction}
 
-# ---------- Location APIs ----------
+# ---------- Requests ----------
+@api_router.get("/requests")
+def get_requests(user: dict = Depends(get_current_user)):
+    dating = sb.table("dating_requests").select("*").eq("to_user_id", user["user_id"]).eq("status", "pending").execute().data or []
+    friend = sb.table("friend_requests").select("*").eq("to_user_id", user["user_id"]).eq("status", "pending").execute().data or []
+
+    result = []
+    for req in dating:
+        from_profile = _maybe(sb.table("user_profiles").select("display_name,profile_image,country").eq("user_id", req["from_user_id"]).maybe_single().execute())
+        if from_profile:
+            result.append({
+                "request_id": req["request_id"],
+                "type": "dating",
+                "from_user_id": req["from_user_id"],
+                "from_name": from_profile.get("display_name","Someone"),
+                "from_image": get_proxied_image_url(from_profile.get("profile_image","")),
+                "from_country": from_profile.get("country",""),
+                "created_at": req["created_at"],
+                "status": req["status"],
+            })
+    for req in friend:
+        from_profile = _maybe(sb.table("user_profiles").select("display_name,profile_image,country").eq("user_id", req["from_user_id"]).maybe_single().execute())
+        if from_profile:
+            result.append({
+                "request_id": req["request_id"],
+                "type": "friend",
+                "from_user_id": req["from_user_id"],
+                "from_name": from_profile.get("display_name","Someone"),
+                "from_image": get_proxied_image_url(from_profile.get("profile_image","")),
+                "from_country": from_profile.get("country",""),
+                "created_at": req["created_at"],
+                "status": req["status"],
+            })
+    return result
+
+@api_router.post("/requests/{request_id}/respond")
+def respond_request(request_id: str, action: str, user: dict = Depends(get_current_user)):
+    if action not in ["accept","reject"]:
+        raise HTTPException(400, "Action must be 'accept' or 'reject'")
+
+    req = _maybe(sb.table("dating_requests").select("*").eq("request_id", request_id).eq("to_user_id", user["user_id"]).maybe_single().execute())
+    table = "dating_requests"
+    if not req:
+        req = _maybe(sb.table("friend_requests").select("*").eq("request_id", request_id).eq("to_user_id", user["user_id"]).maybe_single().execute())
+        table = "friend_requests"
+    if not req:
+        raise HTTPException(404, "Request not found")
+
+    new_status = "accepted" if action == "accept" else "rejected"
+    if req["status"] != "pending":
+        raise HTTPException(400, "Request already handled")
+
+    sb.table(table).update({"status": new_status, "updated_at": datetime.now(timezone.utc).isoformat()}).eq("request_id", request_id).execute()
+
+    if action == "accept":
+        swipe_type = "dating" if table == "dating_requests" else "friendship"
+        uid1, uid2 = sorted([user["user_id"], req["from_user_id"]])
+        exist_match = _maybe(sb.table("profile_matches").select("*").eq("user1_id", uid1).eq("user2_id", uid2).eq("swipe_type", swipe_type).maybe_single().execute())
+        if not exist_match:
+            match_id = f"match_{uuid.uuid4().hex[:12]}"
+            sb.table("profile_matches").insert({"match_id": match_id, "user1_id": uid1, "user2_id": uid2, "swipe_type": swipe_type, "created_at": datetime.now(timezone.utc).isoformat()}).execute()
+
+    from_profile = get_profile(user)
+    notif_type = "dating_accepted" if table == "dating_requests" else "friend_accepted"
+    sb.table("notifications").insert({
+        "notification_id": f"notif_{uuid.uuid4().hex[:12]}",
+        "user_id": req["from_user_id"],
+        "from_user_id": user["user_id"],
+        "type": notif_type,
+        "message": f"{from_profile.get('display_name','Someone')} {action}ed your request",
+        "created_at": datetime.now(timezone.utc).isoformat()
+    }).execute()
+
+    return {"ok": True, "status": new_status}
+
+# ---------- Notifications ----------
+@api_router.get("/notifications")
+def get_notifications(user: dict = Depends(get_current_user)):
+    notifs = sb.table("notifications").select("*").eq("user_id", user["user_id"]).order("created_at", desc=True).limit(50).execute().data or []
+    for n in notifs:
+        from_profile = _maybe(sb.table("user_profiles").select("display_name,profile_image").eq("user_id", n["from_user_id"]).maybe_single().execute())
+        n["from_name"] = from_profile.get("display_name","Someone") if from_profile else "Someone"
+        n["from_image"] = get_proxied_image_url(from_profile.get("profile_image","")) if from_profile else ""
+    return notifs
+
+@api_router.post("/notifications/read")
+def mark_notifications_read(user: dict = Depends(get_current_user)):
+    sb.table("notifications").update({"read": True}).eq("user_id", user["user_id"]).eq("read", False).execute()
+    return {"ok": True}
+
+# ---------- Location APIs (Country/City lists - for display only) ----------
 @api_router.get("/location/countries")
 def get_countries():
+    """Return list of countries (for display/educational purposes only)"""
     try:
         resp = httpx.get("https://restcountries.com/v3.1/all?fields=name,cca2", timeout=5)
         if resp.status_code == 200:
             return [{"code": c["cca2"], "name": c["name"]["common"]} for c in resp.json()]
     except: pass
     return [
-{"code":"AF","name":"Afghanistan"},
-{"code":"AL","name":"Albania"},
-{"code":"DZ","name":"Algeria"},
-{"code":"AD","name":"Andorra"},
-{"code":"AO","name":"Angola"},
-{"code":"AG","name":"Antigua and Barbuda"},
-{"code":"AR","name":"Argentina"},
-{"code":"AM","name":"Armenia"},
-{"code":"AU","name":"Australia"},
-{"code":"AT","name":"Austria"},
-{"code":"AZ","name":"Azerbaijan"},
-{"code":"BS","name":"Bahamas"},
-{"code":"BH","name":"Bahrain"},
-{"code":"BD","name":"Bangladesh"},
-{"code":"BB","name":"Barbados"},
-{"code":"BY","name":"Belarus"},
-{"code":"BE","name":"Belgium"},
-{"code":"BZ","name":"Belize"},
-{"code":"BJ","name":"Benin"},
-{"code":"BT","name":"Bhutan"},
-{"code":"BO","name":"Bolivia"},
-{"code":"BA","name":"Bosnia and Herzegovina"},
-{"code":"BW","name":"Botswana"},
-{"code":"BR","name":"Brazil"},
-{"code":"BN","name":"Brunei"},
-{"code":"BG","name":"Bulgaria"},
-{"code":"BF","name":"Burkina Faso"},
-{"code":"BI","name":"Burundi"},
-{"code":"CV","name":"Cabo Verde"},
-{"code":"KH","name":"Cambodia"},
-{"code":"CM","name":"Cameroon"},
-{"code":"CA","name":"Canada"},
-{"code":"CF","name":"Central African Republic"},
-{"code":"TD","name":"Chad"},
-{"code":"CL","name":"Chile"},
-{"code":"CN","name":"China"},
-{"code":"CO","name":"Colombia"},
-{"code":"KM","name":"Comoros"},
-{"code":"CG","name":"Congo"},
-{"code":"CD","name":"Congo (Democratic Republic)"},
-{"code":"CR","name":"Costa Rica"},
-{"code":"CI","name":"Côte d’Ivoire"},
-{"code":"HR","name":"Croatia"},
-{"code":"CU","name":"Cuba"},
-{"code":"CY","name":"Cyprus"},
-{"code":"CZ","name":"Czechia"},
-{"code":"DK","name":"Denmark"},
-{"code":"DJ","name":"Djibouti"},
-{"code":"DM","name":"Dominica"},
-{"code":"DO","name":"Dominican Republic"},
-{"code":"EC","name":"Ecuador"},
-{"code":"EG","name":"Egypt"},
-{"code":"SV","name":"El Salvador"},
-{"code":"GQ","name":"Equatorial Guinea"},
-{"code":"ER","name":"Eritrea"},
-{"code":"EE","name":"Estonia"},
-{"code":"SZ","name":"Eswatini"},
-{"code":"ET","name":"Ethiopia"},
-{"code":"FJ","name":"Fiji"},
-{"code":"FI","name":"Finland"},
-{"code":"FR","name":"France"},
-{"code":"GA","name":"Gabon"},
-{"code":"GM","name":"Gambia"},
-{"code":"GE","name":"Georgia"},
-{"code":"DE","name":"Germany"},
-{"code":"GH","name":"Ghana"},
-{"code":"GR","name":"Greece"},
-{"code":"GD","name":"Grenada"},
-{"code":"GT","name":"Guatemala"},
-{"code":"GN","name":"Guinea"},
-{"code":"GW","name":"Guinea-Bissau"},
-{"code":"GY","name":"Guyana"},
-{"code":"HT","name":"Haiti"},
-{"code":"HN","name":"Honduras"},
-{"code":"HU","name":"Hungary"},
-{"code":"IS","name":"Iceland"},
-{"code":"IN","name":"India"},
-{"code":"ID","name":"Indonesia"},
-{"code":"IR","name":"Iran"},
-{"code":"IQ","name":"Iraq"},
-{"code":"IE","name":"Ireland"},
-{"code":"IL","name":"Israel"},
-{"code":"IT","name":"Italy"},
-{"code":"JM","name":"Jamaica"},
-{"code":"JP","name":"Japan"},
-{"code":"JO","name":"Jordan"},
-{"code":"KZ","name":"Kazakhstan"},
-{"code":"KE","name":"Kenya"},
-{"code":"KI","name":"Kiribati"},
-{"code":"XK","name":"Kosovo"},
-{"code":"KW","name":"Kuwait"},
-{"code":"KG","name":"Kyrgyzstan"},
-{"code":"LA","name":"Laos"},
-{"code":"LV","name":"Latvia"},
-{"code":"LB","name":"Lebanon"},
-{"code":"LS","name":"Lesotho"},
-{"code":"LR","name":"Liberia"},
-{"code":"LY","name":"Libya"},
-{"code":"LI","name":"Liechtenstein"},
-{"code":"LT","name":"Lithuania"},
-{"code":"LU","name":"Luxembourg"},
-{"code":"MG","name":"Madagascar"},
-{"code":"MW","name":"Malawi"},
-{"code":"MY","name":"Malaysia"},
-{"code":"MV","name":"Maldives"},
-{"code":"ML","name":"Mali"},
-{"code":"MT","name":"Malta"},
-{"code":"MH","name":"Marshall Islands"},
-{"code":"MR","name":"Mauritania"},
-{"code":"MU","name":"Mauritius"},
-{"code":"MX","name":"Mexico"},
-{"code":"FM","name":"Micronesia"},
-{"code":"MD","name":"Moldova"},
-{"code":"MC","name":"Monaco"},
-{"code":"MN","name":"Mongolia"},
-{"code":"ME","name":"Montenegro"},
-{"code":"MA","name":"Morocco"},
-{"code":"MZ","name":"Mozambique"},
-{"code":"MM","name":"Myanmar"},
-{"code":"NA","name":"Namibia"},
-{"code":"NR","name":"Nauru"},
-{"code":"NP","name":"Nepal"},
-{"code":"NL","name":"Netherlands"},
-{"code":"NZ","name":"New Zealand"},
-{"code":"NI","name":"Nicaragua"},
-{"code":"NE","name":"Niger"},
-{"code":"NG","name":"Nigeria"},
-{"code":"KP","name":"North Korea"},
-{"code":"MK","name":"North Macedonia"},
-{"code":"NO","name":"Norway"},
-{"code":"OM","name":"Oman"},
-{"code":"PK","name":"Pakistan"},
-{"code":"PS","name":"Palestine"},
-{"code":"PW","name":"Palau"},
-{"code":"PA","name":"Panama"},
-{"code":"PG","name":"Papua New Guinea"},
-{"code":"PY","name":"Paraguay"},
-{"code":"PE","name":"Peru"},
-{"code":"PH","name":"Philippines"},
-{"code":"PL","name":"Poland"},
-{"code":"PT","name":"Portugal"},
-{"code":"QA","name":"Qatar"},
-{"code":"RO","name":"Romania"},
-{"code":"RU","name":"Russia"},
-{"code":"RW","name":"Rwanda"},
-{"code":"KN","name":"Saint Kitts and Nevis"},
-{"code":"LC","name":"Saint Lucia"},
-{"code":"VC","name":"Saint Vincent and the Grenadines"},
-{"code":"WS","name":"Samoa"},
-{"code":"SM","name":"San Marino"},
-{"code":"ST","name":"Sao Tome and Principe"},
-{"code":"SA","name":"Saudi Arabia"},
-{"code":"SN","name":"Senegal"},
-{"code":"RS","name":"Serbia"},
-{"code":"SC","name":"Seychelles"},
-{"code":"SL","name":"Sierra Leone"},
-{"code":"SG","name":"Singapore"},
-{"code":"SK","name":"Slovakia"},
-{"code":"SI","name":"Slovenia"},
-{"code":"SB","name":"Solomon Islands"},
-{"code":"SO","name":"Somalia"},
-{"code":"ZA","name":"South Africa"},
-{"code":"SS","name":"South Sudan"},
-{"code":"ES","name":"Spain"},
-{"code":"LK","name":"Sri Lanka"},
-{"code":"SD","name":"Sudan"},
-{"code":"SR","name":"Suriname"},
-{"code":"SE","name":"Sweden"},
-{"code":"CH","name":"Switzerland"},
-{"code":"SY","name":"Syria"},
-{"code":"TW","name":"Taiwan"},
-{"code":"TJ","name":"Tajikistan"},
-{"code":"TZ","name":"Tanzania"},
-{"code":"TH","name":"Thailand"},
-{"code":"TL","name":"Timor-Leste"},
-{"code":"TG","name":"Togo"},
-{"code":"TO","name":"Tonga"},
-{"code":"TT","name":"Trinidad and Tobago"},
-{"code":"TN","name":"Tunisia"},
-{"code":"TR","name":"Turkey"},
-{"code":"TM","name":"Turkmenistan"},
-{"code":"TV","name":"Tuvalu"},
-{"code":"UG","name":"Uganda"},
-{"code":"UA","name":"Ukraine"},
-{"code":"AE","name":"United Arab Emirates"},
-{"code":"GB","name":"United Kingdom"},
-{"code":"US","name":"United States"},
-{"code":"UY","name":"Uruguay"},
-{"code":"UZ","name":"Uzbekistan"},
-{"code":"VU","name":"Vanuatu"},
-{"code":"VA","name":"Vatican City"},
-{"code":"VE","name":"Venezuela"},
-{"code":"VN","name":"Vietnam"},
-{"code":"YE","name":"Yemen"},
-{"code":"ZM","name":"Zambia"},
-{"code":"ZW","name":"Zimbabwe"}
-]
-
-
-
+        {"code":"ZA","name":"South Africa"}, {"code":"US","name":"United States"},
+        {"code":"GB","name":"United Kingdom"}, {"code":"CA","name":"Canada"},
+        {"code":"AU","name":"Australia"}, {"code":"IN","name":"India"},
+    ]
 
 @api_router.get("/location/cities")
 def get_cities(country: str):
+    """Return list of cities (for display/educational purposes only)"""
     try:
         resp = httpx.post("https://countriesnow.space/api/v0.1/countries/cities", json={"country": country}, timeout=5)
         if resp.status_code == 200 and not resp.json().get("error"):
