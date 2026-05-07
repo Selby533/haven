@@ -19,6 +19,31 @@ SUPABASE_KEY = os.environ['SUPABASE_SERVICE_ROLE_KEY']
 sb: Client = create_client(SUPABASE_URL.rstrip('/'), SUPABASE_KEY)
 
 app = FastAPI()
+
+
+
+
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=[
+        "https://havenpositive.online",
+        "https://www.havenpositive.online",
+        "https://haven-83b20.web.app",
+        "https://haven-83b20.firebaseapp.com",
+        "https://haven-hmwq.onrender.com",
+        "http://localhost:3000",
+    ],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+
+
+
+
+
 api_router = APIRouter(prefix="/api")
 
 # ---------- Constants ----------
