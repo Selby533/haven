@@ -11,10 +11,6 @@ from datetime import datetime, timezone, timedelta
 from PIL import Image
 import httpx as httpx_lib
 
-# SendGrid for email reminders
-import sendgrid
-from sendgrid.helpers.mail import Mail
-
 ROOT_DIR = Path(__file__).parent
 load_dotenv(ROOT_DIR / '.env')
 
@@ -115,29 +111,6 @@ async def get_location_from_ip(ip: str) -> tuple:
         logger.error(f"IP geolocation failed: {e}")
     return None
 
-# ---------- Email helper ----------
-def send_reminder_email(to_email: str, name: str):
-    sg_api_key = os.environ.get("SENDGRID_API_KEY")
-    if not sg_api_key:
-        logger.warning("SENDGRID_API_KEY not set – cannot send email")
-        return
-
-    sg = sendgrid.SendGridAPIClient(api_key=sg_api_key)
-
-    message = Mail(
-        from_email=os.environ.get("FROM_EMAIL", "hello@havenpositive.online"),
-        to_emails=to_email,
-        subject="You've been missed on Haven 💜",
-        html_content=f"""
-        <p>Hi {name or 'there'},</p>
-        <p>We noticed you haven't visited Haven in a few days. Your community is waiting for you!</p>
-        <p><a href="https://havenpositive.online">Come back to Haven</a></p>
-        <p>Warmly,<br>The Haven Team</p>
-        """
-    )
-
-    sg.send(message)
-
 # ---------- Image Helpers (WebP) ----------
 def compress_image(base64_str: str, max_size_kb: int = 300) -> bytes:
     if "," in base64_str:
@@ -169,7 +142,6 @@ def upload_image_to_supabase(file_bytes: bytes, user_id: str, filename: str) -> 
             "cache-control": "public, max-age=31536000, immutable"
         }
     )
-    # Return direct public URL (CDN will cache it)
     return f"{SUPABASE_URL}/storage/v1/object/public/{STORAGE_BUCKET}/{path}"
 
 def process_image_field(image_value: str, user_id: str, filename_prefix: str) -> str:
@@ -178,7 +150,7 @@ def process_image_field(image_value: str, user_id: str, filename_prefix: str) ->
     if image_value.startswith("data:image") or (len(image_value) > 1000 and "base64" in image_value):
         try:
             compressed = compress_image(image_value)
-            filename = f"{filename_prefix}_{uuid.uuid4().hex[:8]}.jpg"   # extension doesn't matter, content-type is webp
+            filename = f"{filename_prefix}_{uuid.uuid4().hex[:8]}.jpg"
             return upload_image_to_supabase(compressed, user_id, filename)
         except Exception as e:
             logger.error(f"Image compression/upload failed: {e}")
@@ -276,8 +248,6 @@ def auth_google(payload: GoogleAuthPayload, request: Request, response: Response
         }).execute()
     expires_at = datetime.now(timezone.utc) + timedelta(days=7)
     sb.table("user_sessions").upsert({"session_token": session_token, "user_id": user_id, "expires_at": expires_at.isoformat(), "created_at": now_iso}).execute()
-    # Record login time
-    sb.table("users").update({"last_login": now_iso}).eq("user_id", user_id).execute()
     response.set_cookie(
         key="session_token",
         value=session_token,
@@ -622,7 +592,6 @@ def swipe_profile(payload: SwipePayload, user: dict = Depends(get_current_user))
                 "swipe_type": payload.swipe_type
             }).execute()
         except Exception:
-            # Duplicate swipe – just ignore it
             pass
 
     matched = False
@@ -858,35 +827,6 @@ def get_notifications(user: dict = Depends(get_current_user)):
 def mark_notifications_read(user: dict = Depends(get_current_user)):
     sb.table("notifications").update({"read": True}).eq("user_id", user["user_id"]).eq("read", False).execute()
     return {"ok": True}
-
-# ---------- Cron: Send reminders to inactive users ----------
-@api_router.post("/cron/send-reminders")
-def send_inactive_reminders():
-    now = datetime.now(timezone.utc)
-    # TESTING: use 2 minutes instead of 5 days
-    two_minutes_ago = now - timedelta(minutes=2)
-
-    # Find users whose last login is before 2 minutes ago
-    # and haven't been reminded in that window
-    users = sb.table("users").select("user_id,email,name") \
-        .lt("last_login", two_minutes_ago) \
-        .or_("last_reminder_sent.is.null,last_reminder_sent.lt.{}".format(two_minutes_ago.isoformat())) \
-        .execute()
-
-    sent_count = 0
-    for u in (users.data or []):
-        email = u.get("email")
-        if not email:
-            continue
-        try:
-            send_reminder_email(email, u.get("name", "there"))
-            # Mark reminder as sent
-            sb.table("users").update({"last_reminder_sent": now.isoformat()}).eq("user_id", u["user_id"]).execute()
-            sent_count += 1
-        except Exception as e:
-            logger.error(f"Failed to send reminder to {email}: {e}")
-
-    return {"ok": True, "reminders_sent": sent_count}
 
 # ---------- Stories ----------
 @api_router.post("/stories")
