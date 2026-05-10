@@ -743,6 +743,37 @@ def get_requests(user: dict = Depends(get_current_user)):
             })
     return result
 
+
+
+
+
+@api_router.get("/unread-counts")
+def get_unread_counts(user: dict = Depends(get_current_user)):
+    # Count unread messages where user is the recipient (sender != user)
+    unread_res = sb.table("match_messages") \
+        .select("match_id") \
+        .neq("sender_id", user["user_id"]) \
+        .eq("read", False) \
+        .execute()
+    match_ids = set()
+    for row in (unread_res.data or []):
+        match_ids.add(row["match_id"])
+
+    dating_count = 0
+    friend_count = 0
+    if match_ids:
+        for mid in match_ids:
+            match = _maybe(sb.table("profile_matches").select("swipe_type").eq("match_id", mid).maybe_single().execute())
+            if match:
+                if match.get("swipe_type") == "friendship":
+                    friend_count += 1
+                else:
+                    dating_count += 1
+    return {"dating_unread": dating_count, "friend_unread": friend_count}
+
+
+    
+
 @api_router.post("/requests/{request_id}/respond")
 def respond_request(request_id: str, action: str, user: dict = Depends(get_current_user)):
     if action not in ["accept","reject"]:
