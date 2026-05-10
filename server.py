@@ -583,21 +583,21 @@ def swipe_profile(payload: SwipePayload, user: dict = Depends(get_current_user))
     target = _maybe(sb.table("user_profiles").select("user_id").eq("user_id", payload.swiped_id).maybe_single().execute())
     if not target: raise HTTPException(404)
     existing = _maybe(sb.table("profile_swipes").select("*").eq("swiper_id", user["user_id"]).eq("swiped_id", payload.swiped_id).eq("swipe_type", payload.swipe_type).maybe_single().execute())
-   
+    if not existing:
+        try:
+            sb.table("profile_swipes").insert({
+                "swipe_id": f"swp_{uuid.uuid4().hex[:12]}",
+                "swiper_id": user["user_id"],
+                "swiped_id": payload.swiped_id,
+                "direction": payload.direction,
+                "swipe_type": payload.swipe_type
+            }).execute()
+        except Exception:
+            # Duplicate swipe – just ignore it
+            pass
 
-  if not existing:
-    try:
-        sb.table("profile_swipes").insert({
-            "swipe_id": f"swp_{uuid.uuid4().hex[:12]}",
-            "swiper_id": user["user_id"],
-            "swiped_id": payload.swiped_id,
-            "direction": payload.direction,
-            "swipe_type": payload.swipe_type
-        }).execute()
-    except Exception:
-        # Duplicate swipe – just ignore it
-        pass
-    matched = False; match_id = None
+    matched = False
+    match_id = None
     if payload.direction == "like":
         from_profile = get_profile(user)
         if payload.swipe_type == "dating":
@@ -648,8 +648,11 @@ def swipe_profile(payload: SwipePayload, user: dict = Depends(get_current_user))
                     "message": f"You matched with {from_profile.get('display_name', 'Someone')}!",
                     "created_at": datetime.now(timezone.utc).isoformat()
                 }).execute()
-            else: match_id = exist_match["match_id"]
+            else:
+                match_id = exist_match["match_id"]
     return {"ok": True, "matched": matched, "match_id": match_id, "direction": payload.direction}
+
+
 
 @api_router.get("/discover/matches")
 def get_matches(swipe_type: Optional[str] = 'dating', user: dict = Depends(get_current_user)):
