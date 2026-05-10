@@ -863,14 +863,14 @@ def mark_notifications_read(user: dict = Depends(get_current_user)):
 @api_router.post("/cron/send-reminders")
 def send_inactive_reminders():
     now = datetime.now(timezone.utc)
-    five_days_ago = now - timedelta(days=5)
+    # TESTING: use 2 minutes instead of 5 days
+    two_minutes_ago = now - timedelta(minutes=2)
 
-    # Find users whose last login was between 5 and 6 days ago,
-    # and haven't been sent a reminder in that period
+    # Find users whose last login is before 2 minutes ago
+    # and haven't been reminded in that window
     users = sb.table("users").select("user_id,email,name") \
-        .lt("last_login", five_days_ago) \
-        .gte("last_login", five_days_ago - timedelta(days=1)) \
-        .or_("last_reminder_sent.is.null,last_reminder_sent.lt.{}".format(five_days_ago.isoformat())) \
+        .lt("last_login", two_minutes_ago) \
+        .or_("last_reminder_sent.is.null,last_reminder_sent.lt.{}".format(two_minutes_ago.isoformat())) \
         .execute()
 
     sent_count = 0
