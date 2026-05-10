@@ -6,3 +6,4 @@ httpx
 python-multipart
 pydantic
 Pillow
+sendgrid

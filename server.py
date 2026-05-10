@@ -11,6 +11,10 @@ from datetime import datetime, timezone, timedelta
 from PIL import Image
 import httpx as httpx_lib
 
+# SendGrid for email reminders
+import sendgrid
+from sendgrid.helpers.mail import Mail
+
 ROOT_DIR = Path(__file__).parent
 load_dotenv(ROOT_DIR / '.env')
 
@@ -110,6 +114,29 @@ async def get_location_from_ip(ip: str) -> tuple:
     except Exception as e:
         logger.error(f"IP geolocation failed: {e}")
     return None
+
+# ---------- Email helper ----------
+def send_reminder_email(to_email: str, name: str):
+    sg_api_key = os.environ.get("SENDGRID_API_KEY")
+    if not sg_api_key:
+        logger.warning("SENDGRID_API_KEY not set – cannot send email")
+        return
+
+    sg = sendgrid.SendGridAPIClient(api_key=sg_api_key)
+
+    message = Mail(
+        from_email=os.environ.get("FROM_EMAIL", "hello@havenpositive.online"),
+        to_emails=to_email,
+        subject="You've been missed on Haven 💜",
+        html_content=f"""
+        <p>Hi {name or 'there'},</p>
+        <p>We noticed you haven't visited Haven in a few days. Your community is waiting for you!</p>
+        <p><a href="https://havenpositive.online">Come back to Haven</a></p>
+        <p>Warmly,<br>The Haven Team</p>
+        """
+    )
+
+    sg.send(message)
 
 # ---------- Image Helpers (WebP) ----------
 def compress_image(base64_str: str, max_size_kb: int = 300) -> bytes:
@@ -249,6 +276,8 @@ def auth_google(payload: GoogleAuthPayload, request: Request, response: Response
         }).execute()
     expires_at = datetime.now(timezone.utc) + timedelta(days=7)
     sb.table("user_sessions").upsert({"session_token": session_token, "user_id": user_id, "expires_at": expires_at.isoformat(), "created_at": now_iso}).execute()
+    # Record login time
+    sb.table("users").update({"last_login": now_iso}).eq("user_id", user_id).execute()
     response.set_cookie(
         key="session_token",
         value=session_token,
@@ -652,8 +681,6 @@ def swipe_profile(payload: SwipePayload, user: dict = Depends(get_current_user))
                 match_id = exist_match["match_id"]
     return {"ok": True, "matched": matched, "match_id": match_id, "direction": payload.direction}
 
-
-
 @api_router.get("/discover/matches")
 def get_matches(swipe_type: Optional[str] = 'dating', user: dict = Depends(get_current_user)):
     matches = sb.table("profile_matches").select("*").or_(f"user1_id.eq.{user['user_id']},user2_id.eq.{user['user_id']}").eq("swipe_type", swipe_type).order("created_at", desc=True).execute()
@@ -831,6 +858,35 @@ def get_notifications(user: dict = Depends(get_current_user)):
 def mark_notifications_read(user: dict = Depends(get_current_user)):
     sb.table("notifications").update({"read": True}).eq("user_id", user["user_id"]).eq("read", False).execute()
     return {"ok": True}
+
+# ---------- Cron: Send reminders to inactive users ----------
+@api_router.post("/cron/send-reminders")
+def send_inactive_reminders():
+    now = datetime.now(timezone.utc)
+    five_days_ago = now - timedelta(days=5)
+
+    # Find users whose last login was between 5 and 6 days ago,
+    # and haven't been sent a reminder in that period
+    users = sb.table("users").select("user_id,email,name") \
+        .lt("last_login", five_days_ago) \
+        .gte("last_login", five_days_ago - timedelta(days=1)) \
+        .or_("last_reminder_sent.is.null,last_reminder_sent.lt.{}".format(five_days_ago.isoformat())) \
+        .execute()
+
+    sent_count = 0
+    for u in (users.data or []):
+        email = u.get("email")
+        if not email:
+            continue
+        try:
+            send_reminder_email(email, u.get("name", "there"))
+            # Mark reminder as sent
+            sb.table("users").update({"last_reminder_sent": now.isoformat()}).eq("user_id", u["user_id"]).execute()
+            sent_count += 1
+        except Exception as e:
+            logger.error(f"Failed to send reminder to {email}: {e}")
+
+    return {"ok": True, "reminders_sent": sent_count}
 
 # ---------- Stories ----------
 @api_router.post("/stories")
