@@ -337,7 +337,7 @@ def purchase_verify(user: dict = Depends(get_current_user)):
 def purchase_premium(tier: str = "gold", user: dict = Depends(get_current_user)):
     if is_premium(user):
         raise HTTPException(400, "You already have an active premium subscription. Please wait for it to expire.")
-    if tier not in ["gold", "premium"]:
+    if tier not in ["gold", "platinum"]:
         raise HTTPException(400, "Invalid tier")
     cost = GOLD_COST if tier == "gold" else PREMIUM_COST
     days = GOLD_DAYS if tier == "gold" else PREMIUM_DAYS
