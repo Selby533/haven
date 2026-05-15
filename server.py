@@ -512,10 +512,10 @@ async def capture_diamond_order(
         raise HTTPException(500, "Payment capture failed")
 
     packages = {
-        "60": 60,
+        "52":  52,
         "120": 120,
-        "300": 300,
-        "700": 700,
+        "310": 310,
+        "770": 770,
     }
     diamonds = packages.get(package_id)
     if not diamonds:
