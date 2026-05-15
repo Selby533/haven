@@ -162,7 +162,7 @@ def is_premium(user: dict) -> bool:
 def require_token(user: dict, cost: int = 1):
     if is_premium(user): return
     if user.get("tokens", 0) < cost:
-        raise HTTPException(status_code=402, detail="Not enough tokens")
+        raise HTTPException(status_code=402, detail="You need a token to do this. Earn them in the balloon game or upgrade to premium.")
     sb.table("users").update({"tokens": user["tokens"] - cost}).eq("user_id", user["user_id"]).execute()
     user["tokens"] -= cost
 
@@ -177,8 +177,8 @@ class ProfileSetupPayload(BaseModel):
     date_of_birth: str; gender: str; health_status: str
     sexual_orientation: Optional[str] = ""
     positive_since: Optional[str] = ""
-    height: Optional[str] = ""                # free-text display (e.g., 5'10")
-    ethnicity: Optional[str] = ""             # must be from ETHNICITY_LIST if provided
+    height: Optional[str] = ""
+    ethnicity: Optional[str] = ""
     religion: Optional[str] = ""
     display_name: Optional[str] = ""; bio: Optional[str] = ""
     interests: Optional[str] = ""; looking_for: Optional[str] = ""
@@ -189,11 +189,12 @@ class ProfileSetupPayload(BaseModel):
     pref_gender: Optional[str] = ""; pref_min_age: Optional[int] = 18
     pref_max_age: Optional[int] = 99; pref_country: Optional[str] = ""
     pref_max_distance: Optional[int] = 50; pref_health_status: Optional[str] = ""
+    pref_sexual_orientation: Optional[str] = ""
     profile_hidden: Optional[bool] = False
     hide_from_min_age: Optional[int] = None; hide_from_max_age: Optional[int] = None
     hide_from_health_statuses: Optional[str] = ""
     visible_to: Optional[str] = "all"           # "all" or "verified_only"
-    pref_sexual_orientation: Optional[str] = ""
+    lock_all_images: Optional[bool] = False     # if True, all images locked for free viewers
 
 class ProfileUpdatePayload(BaseModel):
     date_of_birth: Optional[str] = None; gender: Optional[str] = None; health_status: Optional[str] = None
@@ -210,11 +211,12 @@ class ProfileUpdatePayload(BaseModel):
     pref_gender: Optional[str] = None; pref_min_age: Optional[int] = None
     pref_max_age: Optional[int] = None; pref_country: Optional[str] = None
     pref_max_distance: Optional[int] = None; pref_health_status: Optional[str] = None
+    pref_sexual_orientation: Optional[str] = None
     profile_hidden: Optional[bool] = None
     hide_from_min_age: Optional[int] = None; hide_from_max_age: Optional[int] = None
     hide_from_health_statuses: Optional[str] = None
     visible_to: Optional[str] = None
-    pref_sexual_orientation: Optional[str] = None
+    lock_all_images: Optional[bool] = None
 
 class CreateStoryPayload(BaseModel):
     content: str; category: str; title: Optional[str] = ""
@@ -478,7 +480,7 @@ def get_profile(user: dict) -> dict:
             "location_source": "none",
             "last_active": user.get("last_active"),
             "verified": False, "premium_tier": None,
-            "visible_to": "all", "pref_sexual_orientation": ""
+            "visible_to": "all", "pref_sexual_orientation": "", "lock_all_images": False
         }
     lat = profile.get("gps_latitude"); lon = profile.get("gps_longitude")
     country = profile.get("country") if lat is not None else None
@@ -507,27 +509,33 @@ def get_profile(user: dict) -> dict:
         "pref_max_age": profile.get("pref_max_age",99), "pref_country": profile.get("pref_country",""),
         "pref_max_distance": profile.get("pref_max_distance",50),
         "pref_health_status": profile.get("pref_health_status",""),
+        "pref_sexual_orientation": profile.get("pref_sexual_orientation",""),
         "profile_hidden": profile.get("profile_hidden", False),
         "hide_from_min_age": profile.get("hide_from_min_age"),
         "hide_from_max_age": profile.get("hide_from_max_age"),
         "hide_from_health_statuses": profile.get("hide_from_health_statuses",""),
+        "visible_to": profile.get("visible_to", "all"),
+        "lock_all_images": profile.get("lock_all_images", False),
         "gps_latitude": lat, "gps_longitude": lon,
         "gps_verified_at": profile.get("gps_verified_at"),
         "location_source": profile.get("location_source", "none"),
         "last_active": user.get("last_active"),
         "verified": user.get("verified", False),
-        "premium_tier": user.get("premium_tier"),
-        "visible_to": profile.get("visible_to", "all"),
-        "pref_sexual_orientation": profile.get("pref_sexual_orientation", ""),
+        "premium_tier": user.get("premium_tier")
     }
 
 @api_router.post("/profile/setup")
 def setup_profile(payload: ProfileSetupPayload, user: dict = Depends(get_current_user)):
     if payload.ethnicity and payload.ethnicity not in ETHNICITY_LIST:
         raise HTTPException(400, f"Ethnicity must be one of: {', '.join(ETHNICITY_LIST)}")
-    # Restrict visibility setting to verified users
+    # Only verified users can set visibility or lock images
+    if not user.get("verified"):
+        payload.visible_to = "all"
+        payload.lock_all_images = False
     if payload.visible_to == "verified_only" and not user.get("verified"):
         raise HTTPException(400, "Only verified users can restrict visibility to verified members")
+    if payload.lock_all_images and not user.get("verified"):
+        raise HTTPException(400, "Only verified users can lock all images")
     existing_profile = _maybe(sb.table("user_profiles").select("*").eq("user_id", user["user_id"]).maybe_single().execute())
     lat = existing_profile.get("gps_latitude") if existing_profile else None
     lon = existing_profile.get("gps_longitude") if existing_profile else None
@@ -557,11 +565,13 @@ def setup_profile(payload: ProfileSetupPayload, user: dict = Depends(get_current
         "pref_max_age": payload.pref_max_age, "pref_country": payload.pref_country or "",
         "pref_max_distance": payload.pref_max_distance,
         "pref_health_status": payload.pref_health_status or "",
-        "profile_hidden": payload.profile_hidden,
-        "hide_from_min_age": payload.hide_from_min_age, "hide_from_max_age": payload.hide_from_max_age,
-        "hide_from_health_statuses": payload.hide_from_health_statuses or "",
-        "visible_to": payload.visible_to or "all",
         "pref_sexual_orientation": payload.pref_sexual_orientation or "",
+        "profile_hidden": payload.profile_hidden if user.get("verified") else False,
+        "hide_from_min_age": payload.hide_from_min_age if user.get("verified") else None,
+        "hide_from_max_age": payload.hide_from_max_age if user.get("verified") else None,
+        "hide_from_health_statuses": payload.hide_from_health_statuses if user.get("verified") else "",
+        "visible_to": payload.visible_to if user.get("verified") else "all",
+        "lock_all_images": payload.lock_all_images if user.get("verified") else False,
         "onboarding_complete": True,
         "updated_at": datetime.now(timezone.utc).isoformat(),
     }
@@ -586,9 +596,9 @@ def update_profile(payload: ProfileUpdatePayload, user: dict = Depends(get_curre
         "display_name", "bio", "interests", "looking_for",
         "education", "kids", "want_kids", "smoke", "drink", "employment",
         "pref_gender", "pref_min_age", "pref_max_age", "pref_country",
-        "pref_max_distance", "pref_health_status",
+        "pref_max_distance", "pref_health_status", "pref_sexual_orientation",
         "hide_from_min_age", "hide_from_max_age", "hide_from_health_statuses",
-        "visible_to", "pref_sexual_orientation"
+        "visible_to", "lock_all_images"
     ]
     for field in all_fields:
         value = getattr(payload, field, None)
@@ -597,6 +607,8 @@ def update_profile(payload: ProfileUpdatePayload, user: dict = Depends(get_curre
                 raise HTTPException(400, f"Ethnicity must be one of: {', '.join(ETHNICITY_LIST)}")
             if field == "visible_to" and value == "verified_only" and not user.get("verified"):
                 raise HTTPException(400, "Only verified users can restrict visibility to verified members")
+            if field == "lock_all_images" and value and not user.get("verified"):
+                raise HTTPException(400, "Only verified users can lock all images")
             updates[field] = value
     if payload.profile_hidden is not None:
         if not is_premium(user):
@@ -724,7 +736,7 @@ def get_discover_profiles(
 def swipe_profile(payload: SwipePayload, user: dict = Depends(get_current_user)):
     if not is_premium(user):
         if user.get("tokens", 0) < 1:
-            raise HTTPException(402, "Not enough tokens")
+            raise HTTPException(402, "You need a token to swipe. Earn tokens or upgrade to premium.")
         sb.table("users").update({"tokens": user["tokens"] - 1}).eq("user_id", user["user_id"]).execute()
         user["tokens"] -= 1
 
@@ -771,9 +783,7 @@ def chat_start(user: dict = Depends(get_current_user)):
     require_token(user, 1)
     return {"ok": True}
 
-# The rest of the file remains unchanged (matches, messages, stories, flexer, etc.)
-# ... (include all other routes exactly as before, no further modifications needed)
-
+# ---------- Matches / Messages ----------
 @api_router.get("/discover/matches")
 def get_matches(swipe_type: Optional[str] = 'dating', user: dict = Depends(get_current_user)):
     matches = sb.table("profile_matches").select("*").or_(f"user1_id.eq.{user['user_id']},user2_id.eq.{user['user_id']}").eq("swipe_type", swipe_type).order("created_at", desc=True).execute()
@@ -814,7 +824,7 @@ def send_match_message(match_id: str, payload: MatchMessagePayload, user: dict =
         msg_count = count_res.count if hasattr(count_res, 'count') else 0
         if msg_count >= 2:
             if user.get("tokens", 0) < 1:
-                raise HTTPException(402, "Not enough tokens")
+                raise HTTPException(402, "You need a token to send more messages. Earn tokens or upgrade.")
             sb.table("users").update({"tokens": user["tokens"] - 1}).eq("user_id", user["user_id"]).execute()
             user["tokens"] -= 1
     match = _maybe(sb.table("profile_matches").select("*").eq("match_id", match_id).maybe_single().execute())
