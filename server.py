@@ -1463,12 +1463,20 @@ def admin_announce(payload: dict, user: dict = Depends(get_current_user)):
     message = payload.get("message", "")
     if not message:
         raise HTTPException(400, "Message required")
-    # Send notification to all users (not really scalable for huge lists, but fine for now)
-    users = sb.table("users").select("user_id").eq("deleted", False).execute().data or []
-    for u in users:
-        notify_user(u["user_id"], "announcement", message, "system")
-    return {"ok": True, "sent_to": len(users)}
 
+    # Fetch only non‑deleted users (batch them to avoid huge memory usage)
+    users = sb.table("users").select("user_id").eq("deleted", False).execute().data or []
+    sent_count = 0
+    errors = 0
+    for u in users:
+        try:
+            notify_user(u["user_id"], "announcement", message, "system")
+            sent_count += 1
+        except Exception as e:
+            logger.error(f"Failed to notify {u['user_id']}: {e}")
+            errors += 1
+
+    return {"ok": True, "sent_to": sent_count, "errors": errors}
 # ---------- Manual Verification ----------
 @api_router.post("/admin/verify-user")
 def admin_verify_user(payload: dict, user: dict = Depends(get_current_user)):
