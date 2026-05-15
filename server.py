@@ -11,6 +11,11 @@ from datetime import datetime, timezone, timedelta
 from PIL import Image
 import httpx as httpx_lib
 
+import os
+import httpx
+
+
+
 ROOT_DIR = Path(__file__).parent
 load_dotenv(ROOT_DIR / '.env')
 
@@ -413,6 +418,135 @@ def toggle_auto_renew(user: dict = Depends(get_current_user)):
     new_val = not current
     sb.table("users").update({"auto_renew": new_val}).eq("user_id", user["user_id"]).execute()
     return {"ok": True, "auto_renew": new_val}
+
+
+# ---------- PayPal Diamond Purchase (sandbox) ----------
+PAYPAL_API_BASE = "https://api-m.sandbox.paypal.com"  # sandbox for testing
+
+@api_router.post("/diamonds/create-order")
+async def create_diamond_order(
+    package_id: str,
+    request: Request,
+    user: dict = Depends(get_current_user)
+):
+    # Define packages
+    packages = {
+        "60": {"diamonds": 60, "amount": 50.00, "zar": "R50"},
+        "120": {"diamonds": 120, "amount": 100.00, "zar": "R100"},
+        "300": {"diamonds": 300, "amount": 250.00, "zar": "R250"},
+        "700": {"diamonds": 700, "amount": 500.00, "zar": "R500"},
+    }
+    if package_id not in packages:
+        raise HTTPException(400, "Invalid package")
+
+    pkg = packages[package_id]
+
+    # Your sandbox credentials (replace with live later)
+    PAYPAL_CLIENT_ID = "AbbNBFQMlU_9el7alMGRz..."  # full client ID
+    PAYPAL_CLIENT_SECRET = "your-sandbox-secret"     # full secret from dashboard
+
+    # Get PayPal access token
+    auth_response = await httpx.AsyncClient().post(
+        f"{PAYPAL_API_BASE}/v1/oauth2/token",
+        data={"grant_type": "client_credentials"},
+        auth=(PAYPAL_CLIENT_ID, PAYPAL_CLIENT_SECRET),
+        headers={"Accept": "application/json"},
+    )
+    if auth_response.status_code != 200:
+        raise HTTPException(500, "PayPal authentication failed")
+
+    access_token = auth_response.json()["access_token"]
+
+    # Create order
+    order_data = {
+        "intent": "CAPTURE",
+        "purchase_units": [{
+            "amount": {
+                "currency_code": "USD",
+                "value": str(pkg["amount"]),
+            },
+            "description": f"{pkg['diamonds']} Diamonds for {pkg['zar']}",
+            "custom_id": user["user_id"] + ":" + package_id,
+        }],
+        "application_context": {
+            "brand_name": "Haven",
+            "shipping_preference": "NO_SHIPPING",
+            "user_action": "PAY_NOW",
+            "return_url": "https://havenpositive.online/shop",
+            "cancel_url": "https://havenpositive.online/shop",
+        }
+    }
+
+    order_response = await httpx.AsyncClient().post(
+        f"{PAYPAL_API_BASE}/v2/checkout/orders",
+        json=order_data,
+        headers={
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {access_token}",
+        },
+    )
+    if order_response.status_code != 201:
+        raise HTTPException(500, "PayPal order creation failed")
+
+    return order_response.json()
+
+
+@api_router.post("/diamonds/capture-order")
+async def capture_diamond_order(
+    order_id: str,
+    package_id: str,
+    user: dict = Depends(get_current_user)
+):
+    PAYPAL_CLIENT_ID = "AT0fK5UyZpc-12_eyI8TfSbAM_-Ryzc4uvLhfezdbC3ZFpFBWQ1OArGqMQeIALMj0JXHjf3RoyMhhLCJ"  # full client ID
+    PAYPAL_CLIENT_SECRET = "EHuRm89xfNvVGDzPjXZlWkdvcQS26VSzYbR9JuKnLgu44pU3Q_2fY_e51c0Gfq9yg9O_ViFsU__oG_zs"     # full secret
+
+    # Get access token
+    auth_response = await httpx.AsyncClient().post(
+        f"{PAYPAL_API_BASE}/v1/oauth2/token",
+        data={"grant_type": "client_credentials"},
+        auth=(PAYPAL_CLIENT_ID, PAYPAL_CLIENT_SECRET),
+        headers={"Accept": "application/json"},
+    )
+    if auth_response.status_code != 200:
+        raise HTTPException(500, "PayPal authentication failed")
+
+    access_token = auth_response.json()["access_token"]
+
+    # Capture the order
+    capture_response = await httpx.AsyncClient().post(
+        f"{PAYPAL_API_BASE}/v2/checkout/orders/{order_id}/capture",
+        headers={
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {access_token}",
+        },
+    )
+    if capture_response.status_code not in (200, 201):
+        raise HTTPException(500, "Payment capture failed")
+
+    # Credit diamonds
+    packages = {
+        "60": 60,
+        "120": 120,
+        "300": 300,
+        "700": 700,
+    }
+    diamonds = packages.get(package_id)
+    if not diamonds:
+        raise HTTPException(400, "Invalid package")
+
+    new_diamonds = user.get("diamonds", 0) + diamonds
+    sb.table("users").update({"diamonds": new_diamonds}).eq("user_id", user["user_id"]).execute()
+
+    # Record purchase
+    sb.table("diamond_purchases").insert({
+        "purchase_id": f"diam_{uuid.uuid4().hex[:12]}",
+        "user_id": user["user_id"],
+        "item": f"{diamonds}_diamonds_paypal",
+        "diamond_cost": 0,
+        "purchased_at": datetime.now(timezone.utc).isoformat(),
+    }).execute()
+
+    return {"ok": True, "diamonds": new_diamonds}
 
 
 
