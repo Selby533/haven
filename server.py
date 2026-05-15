@@ -1511,6 +1511,59 @@ def admin_image_queue(user: dict = Depends(get_current_user)):
         })
     return result
 
+# ---------- Admin image deletion ----------
+@api_router.delete("/admin/images/{user_id}/{image_type}/{image_index}")
+def admin_delete_image(
+    user_id: str,
+    image_type: str,  # "profile" or "gallery"
+    image_index: int,
+    admin_user: dict = Depends(get_current_user)
+):
+    if not admin_user.get("is_admin"):
+        raise HTTPException(403, "Admin access required")
+    if image_type not in ("profile", "gallery"):
+        raise HTTPException(400, "Image type must be 'profile' or 'gallery'")
+
+    profile = _maybe(sb.table("user_profiles").select("*").eq("user_id", user_id).maybe_single().execute())
+    if not profile:
+        raise HTTPException(404, "User not found")
+
+    if image_type == "profile":
+        image_url = profile.get("profile_image")
+        if not image_url:
+            raise HTTPException(400, "No profile image")
+        path = extract_path_from_url(image_url)
+        if path:
+            try:
+                sb.storage.from_(STORAGE_BUCKET).remove([path])
+            except Exception as e:
+                logger.warning(f"Could not delete profile image {path}: {e}")
+        sb.table("user_profiles").update({"profile_image": None}).eq("user_id", user_id).execute()
+    else:  # gallery
+        gallery = profile.get("gallery_images") or []
+        if image_index < 0 or image_index >= len(gallery):
+            raise HTTPException(400, "Invalid image index")
+        image_url = gallery[image_index]
+        path = extract_path_from_url(image_url)
+        if path:
+            try:
+                sb.storage.from_(STORAGE_BUCKET).remove([path])
+            except Exception as e:
+                logger.warning(f"Could not delete gallery image {path}: {e}")
+        del gallery[image_index]
+        sb.table("user_profiles").update({"gallery_images": gallery}).eq("user_id", user_id).execute()
+
+    return {"ok": True}
+
+def extract_path_from_url(url: str) -> Optional[str]:
+    """Extract bucket path from Supabase storage URL."""
+    if not url:
+        return None
+    prefix = f"{SUPABASE_URL}/storage/v1/object/public/{STORAGE_BUCKET}/"
+    if url.startswith(prefix):
+        return url[len(prefix):]
+    return None
+
 
 app.include_router(api_router)
 
