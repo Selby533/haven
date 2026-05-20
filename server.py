@@ -1573,35 +1573,29 @@ def extract_path_from_url(url: str) -> Optional[str]:
 # ---------- Photo & Story reports ----------
 @api_router.post("/report-content")
 def report_content(payload: dict, user: dict = Depends(get_current_user)):
-    """
-    payload expects: {
-        "reported_user_id": str,
-        "reason": str,           # "nudity" / "violence" / "minor" / "racist" / "stigma" / "sexual"
-        "image_index": int|null, # index in gallery_images, or 0 for profile, null for story
-        "story_id": str|null
-    }
-    """
-    reported_user = payload.get("reported_user_id")
+    reported_user_id = payload.get("reported_user_id")
     reason = payload.get("reason", "")
-    image_index = payload.get("image_index")  # None for story reports
+    image_index = payload.get("image_index")
     story_id = payload.get("story_id")
 
-    if not reported_user or not reason:
-        raise HTTPException(400, "Missing required fields")
+    if not reported_user_id or not reason:
+        raise HTTPException(400, "Missing reported_user_id or reason")
 
-    # Store the report with extra metadata
+    # Create the report – only use columns that exist in user_reports
     sb.table("user_reports").insert({
-        "report_id": f"rep_{uuid.uuid4().hex[:12]}",
         "reporter_id": user["user_id"],
-        "reported_user_id": reported_user,
-        "reason": reason,
-        "metadata": {
-            "image_index": image_index,
-            "story_id": story_id,
-            "type": "story" if story_id else "photo"
-        },
-        "created_at": datetime.now(timezone.utc).isoformat()
+        "reported_user_id": reported_user_id,
+        "reason": f"{reason}" + (f" (image {image_index})" if image_index is not None else "") + (f" (story {story_id})" if story_id else ""),
+        "created_at": datetime.utcnow().isoformat()
     }).execute()
+
+    # Notify the reported user
+    notify_user(
+        reported_user_id,
+        "warning",
+        f"Your content has been reported for: {reason}. Our team will review it.",
+        user["user_id"]
+    )
 
     return {"ok": True}
 
