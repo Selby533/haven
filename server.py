@@ -899,7 +899,7 @@ def get_discover_profiles(
         return []
 
     user_ids = [p["user_id"] for p in profiles]
-    users_data = sb.table("users").select("user_id,verified,premium_tier").in_("user_id", user_ids).execute().data or []
+    users_data = sb.table("users").select("user_id,verified,premium_tier,last_active").in_("user_id", user_ids).execute().data or []
     user_status = {u["user_id"]: u for u in users_data}
 
     filtered = []
@@ -1737,8 +1737,30 @@ def admin_delete_reported_story(report_id: str, user: dict = Depends(get_current
     sb.table("user_reports").delete().eq("report_id", report_id).execute()
     return {"ok": True}
 
+# ---------- Admin: suspend user ----------
+@api_router.post("/admin/suspend")
+def admin_suspend_user(payload: dict, user: dict = Depends(get_current_user)):
+    if not user.get("is_admin"):
+        raise HTTPException(403, "Admin access required")
+    target_id = payload.get("user_id")
+    reason = payload.get("reason", "Violation of guidelines")
+    if not target_id:
+        raise HTTPException(400, "Missing user_id")
+    sb.table("users").update({
+        "deleted": True,
+        "banned": True,
+        "banned_reason": reason
+    }).eq("user_id", target_id).execute()
+    sb.table("user_sessions").delete().eq("user_id", target_id).execute()
+    notify_user(target_id, "warning",
+        f"Your account has been suspended for: {reason}. If you believe this is a mistake, please contact support.",
+        user["user_id"])
+    return {"ok": True}
+
 app.include_router(api_router)
 
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=int(os.environ.get("PORT",8000)))
+    
+   
