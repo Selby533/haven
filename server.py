@@ -1744,6 +1744,332 @@ def get_user_profile(user_id: str):
     if not profile:
         raise HTTPException(404, "User not found")
     return profile
+
+
+
+
+# ===================== GROUPS =====================
+
+@api_router.post("/groups")
+def create_group(payload: dict, user: dict = Depends(get_current_user)):
+    if not is_premium(user):
+        raise HTTPException(400, "Only premium users can create groups")
+    if user.get("diamonds", 0) < 10:
+        raise HTTPException(402, "You need 10 diamonds to create a group")
+
+    title = payload.get("title")
+    if not title or len(title.strip()) == 0:
+        raise HTTPException(400, "Title is required")
+    if len(title) > 100:
+        raise HTTPException(400, "Title too long (max 100)")
+
+    description = payload.get("description", "")
+    rules = payload.get("rules", "")
+    image = payload.get("image", "")
+    join_cost = int(payload.get("join_cost", 0))
+    if join_cost < 0:
+        raise HTTPException(400, "Join cost cannot be negative")
+
+    new_diamonds = user["diamonds"] - 10
+    sb.table("users").update({"diamonds": new_diamonds}).eq("user_id", user["user_id"]).execute()
+
+    if image and (image.startswith("data:image") or "base64" in image):
+        compressed = compress_image(image)
+        filename = f"group_{uuid.uuid4().hex[:8]}.webp"
+        image_url = upload_image_to_supabase(compressed, user["user_id"], filename)
+    else:
+        image_url = image or ""
+
+    group_id = f"grp_{uuid.uuid4().hex[:12]}"
+    now = datetime.now(timezone.utc).isoformat()
+    sb.table("groups").insert({
+        "group_id": group_id,
+        "creator_id": user["user_id"],
+        "title": title.strip(),
+        "description": description,
+        "rules": rules,
+        "image": image_url,
+        "join_cost": join_cost,
+        "created_at": now,
+        "updated_at": now
+    }).execute()
+
+    sb.table("group_members").insert({
+        "group_id": group_id,
+        "user_id": user["user_id"],
+        "role": "creator",
+        "joined_at": now
+    }).execute()
+
+    return {"ok": True, "group_id": group_id}
+
+
+@api_router.get("/groups")
+def list_groups(user: dict = Depends(get_current_user)):
+    groups = sb.table("groups").select("*").execute().data or []
+
+    for g in groups:
+        count_res = sb.table("group_members").select("user_id", count="exact").eq("group_id", g["group_id"]).execute()
+        g["member_count"] = count_res.count if hasattr(count_res, "count") else 0
+
+    groups.sort(key=lambda x: x["member_count"], reverse=True)
+
+    for g in groups:
+        member = sb.table("group_members").select("role").eq("group_id", g["group_id"]).eq("user_id", user["user_id"]).maybe_single().execute().data
+        g["my_role"] = member["role"] if member else None
+
+    return groups
+
+
+@api_router.get("/groups/{group_id}")
+def get_group(group_id: str, user: dict = Depends(get_current_user)):
+    group = _maybe(sb.table("groups").select("*").eq("group_id", group_id).maybe_single().execute())
+    if not group:
+        raise HTTPException(404, "Group not found")
+
+    members = sb.table("group_members").select("user_id,role").eq("group_id", group_id).execute().data or []
+    for m in members:
+        profile = _maybe(sb.table("user_profiles").select("display_name,profile_image").eq("user_id", m["user_id"]).maybe_single().execute())
+        m["display_name"] = profile.get("display_name") if profile else "Unknown"
+        m["profile_image"] = profile.get("profile_image") if profile else ""
+
+    group["members"] = members
+
+    bans = sb.table("group_bans").select("*").eq("group_id", group_id).execute().data or []
+    group["bans"] = bans
+
+    my_member = sb.table("group_members").select("role").eq("group_id", group_id).eq("user_id", user["user_id"]).maybe_single().execute().data
+    group["my_role"] = my_member["role"] if my_member else None
+
+    ban = sb.table("group_bans").select("banned_until").eq("group_id", group_id).eq("user_id", user["user_id"]).maybe_single().execute().data
+    group["am_i_banned"] = False
+    if ban:
+        if ban["banned_until"] is None:
+            group["am_i_banned"] = True
+        else:
+            if _parse_dt(ban["banned_until"]) > datetime.now(timezone.utc):
+                group["am_i_banned"] = True
+
+    return group
+
+
+@api_router.post("/groups/{group_id}/join")
+def join_group(group_id: str, user: dict = Depends(get_current_user)):
+    group = _maybe(sb.table("groups").select("*").eq("group_id", group_id).maybe_single().execute())
+    if not group:
+        raise HTTPException(404, "Group not found")
+
+    existing = sb.table("group_members").select("role").eq("group_id", group_id).eq("user_id", user["user_id"]).maybe_single().execute().data
+    if existing:
+        raise HTTPException(400, "Already a member")
+
+    ban = sb.table("group_bans").select("banned_until").eq("group_id", group_id).eq("user_id", user["user_id"]).maybe_single().execute().data
+    if ban:
+        if ban["banned_until"] is None or _parse_dt(ban["banned_until"]) > datetime.now(timezone.utc):
+            raise HTTPException(403, "You are banned from this group")
+
+    join_cost = group.get("join_cost", 0)
+    if join_cost > 0:
+        if user.get("diamonds", 0) < join_cost:
+            raise HTTPException(402, f"You need {join_cost} diamonds to join this group")
+        new_diamonds = user["diamonds"] - join_cost
+        sb.table("users").update({"diamonds": new_diamonds}).eq("user_id", user["user_id"]).execute()
+
+    sb.table("group_members").insert({
+        "group_id": group_id,
+        "user_id": user["user_id"],
+        "role": "member",
+        "joined_at": datetime.now(timezone.utc).isoformat()
+    }).execute()
+
+    notify_user(group["creator_id"], "group_join", f"{user.get('name', 'Someone')} joined your group {group['title']}", user["user_id"])
+    return {"ok": True}
+
+
+@api_router.delete("/groups/{group_id}/members/{user_id}")
+def remove_member(group_id: str, user_id: str, user: dict = Depends(get_current_user)):
+    group = _maybe(sb.table("groups").select("creator_id").eq("group_id", group_id).maybe_single().execute())
+    if not group:
+        raise HTTPException(404)
+
+    requester = sb.table("group_members").select("role").eq("group_id", group_id).eq("user_id", user["user_id"]).maybe_single().execute().data
+    if not requester:
+        raise HTTPException(403, "You are not a member of this group")
+
+    if requester["role"] == "creator" and user_id != user["user_id"]:
+        sb.table("group_members").delete().eq("group_id", group_id).eq("user_id", user_id).execute()
+        return {"ok": True}
+
+    if requester["role"] == "moderator":
+        target = sb.table("group_members").select("role").eq("group_id", group_id).eq("user_id", user_id).maybe_single().execute().data
+        if target and target["role"] not in ("creator", "moderator"):
+            sb.table("group_members").delete().eq("group_id", group_id).eq("user_id", user_id).execute()
+            return {"ok": True}
+
+    if user_id == user["user_id"]:
+        sb.table("group_members").delete().eq("group_id", group_id).eq("user_id", user["user_id"]).execute()
+        return {"ok": True}
+
+    raise HTTPException(403, "You don't have permission to remove this member")
+
+
+@api_router.put("/groups/{group_id}/members/{user_id}/role")
+def change_member_role(group_id: str, user_id: str, payload: dict, user: dict = Depends(get_current_user)):
+    new_role = payload.get("role")
+    if new_role not in ("moderator", "member"):
+        raise HTTPException(400, "Invalid role")
+
+    group = _maybe(sb.table("groups").select("creator_id").eq("group_id", group_id).maybe_single().execute())
+    if not group or group["creator_id"] != user["user_id"]:
+        raise HTTPException(403, "Only the group creator can change roles")
+
+    sb.table("group_members").update({"role": new_role}).eq("group_id", group_id).eq("user_id", user_id).execute()
+    return {"ok": True}
+
+
+@api_router.post("/groups/{group_id}/messages")
+def send_group_message(group_id: str, payload: dict, user: dict = Depends(get_current_user)):
+    content = payload.get("content", "")
+    if not content.strip():
+        raise HTTPException(400)
+    if contains_profanity(content):
+        raise HTTPException(400, "Message contains inappropriate language")
+
+    member = sb.table("group_members").select("role").eq("group_id", group_id).eq("user_id", user["user_id"]).maybe_single().execute().data
+    if not member:
+        raise HTTPException(403, "You are not a member")
+
+    ban = sb.table("group_bans").select("banned_until").eq("group_id", group_id).eq("user_id", user["user_id"]).maybe_single().execute().data
+    if ban and (ban["banned_until"] is None or _parse_dt(ban["banned_until"]) > datetime.now(timezone.utc)):
+        raise HTTPException(403, "You are banned")
+
+    if not is_premium(user):
+        msg_count_res = sb.table("group_messages").select("message_id", count="exact").eq("group_id", group_id).eq("sender_id", user["user_id"]).execute()
+        msg_count = msg_count_res.count if hasattr(msg_count_res, 'count') else 0
+        if msg_count >= 2:
+            require_token(user, 1)
+
+    message_id = f"gm_{uuid.uuid4().hex[:12]}"
+    sb.table("group_messages").insert({
+        "message_id": message_id,
+        "group_id": group_id,
+        "sender_id": user["user_id"],
+        "content": content.strip(),
+        "created_at": datetime.now(timezone.utc).isoformat()
+    }).execute()
+
+    return {"ok": True, "message_id": message_id}
+
+
+@api_router.get("/groups/{group_id}/messages")
+def get_group_messages(group_id: str, limit: int = 50, before: Optional[str] = None, user: dict = Depends(get_current_user)):
+    member = sb.table("group_members").select("role").eq("group_id", group_id).eq("user_id", user["user_id"]).maybe_single().execute().data
+    if not member:
+        raise HTTPException(403)
+
+    query = sb.table("group_messages").select("*").eq("group_id", group_id).order("created_at", desc=True).limit(limit)
+    if before:
+        query = query.lt("created_at", before)
+    msgs = query.execute().data or []
+    msgs.reverse()
+
+    for msg in msgs:
+        sender = _maybe(sb.table("users").select("name").eq("user_id", msg["sender_id"]).maybe_single().execute())
+        msg["sender_name"] = sender.get("name") if sender else "Unknown"
+
+    return msgs
+
+
+@api_router.delete("/groups/{group_id}/messages/{message_id}")
+def delete_group_message(group_id: str, message_id: str, user: dict = Depends(get_current_user)):
+    msg = _maybe(sb.table("group_messages").select("*").eq("message_id", message_id).eq("group_id", group_id).maybe_single().execute())
+    if not msg:
+        raise HTTPException(404)
+
+    if msg["sender_id"] == user["user_id"]:
+        sb.table("group_messages").update({"deleted": True}).eq("message_id", message_id).execute()
+        return {"ok": True}
+
+    member = sb.table("group_members").select("role").eq("group_id", group_id).eq("user_id", user["user_id"]).maybe_single().execute().data
+    if not member or member["role"] not in ("creator", "moderator"):
+        raise HTTPException(403, "Only moderators or creator can delete others' messages")
+
+    sb.table("group_messages").update({"deleted": True}).eq("message_id", message_id).execute()
+    return {"ok": True}
+
+
+@api_router.post("/groups/{group_id}/bans")
+def ban_user(group_id: str, payload: dict, user: dict = Depends(get_current_user)):
+    group = _maybe(sb.table("groups").select("creator_id").eq("group_id", group_id).maybe_single().execute())
+    if not group or group["creator_id"] != user["user_id"]:
+        raise HTTPException(403, "Only the group creator can ban users")
+
+    target_id = payload.get("user_id")
+    duration_hours = payload.get("duration_hours")
+    reason = payload.get("reason", "")
+
+    banned_until = None
+    if duration_hours:
+        banned_until = datetime.now(timezone.utc) + timedelta(hours=duration_hours)
+
+    ban_id = f"ban_{uuid.uuid4().hex[:12]}"
+    sb.table("group_bans").insert({
+        "ban_id": ban_id,
+        "group_id": group_id,
+        "user_id": target_id,
+        "banned_by": user["user_id"],
+        "reason": reason,
+        "banned_until": banned_until.isoformat() if banned_until else None,
+        "created_at": datetime.now(timezone.utc).isoformat()
+    }).execute()
+
+    sb.table("group_members").delete().eq("group_id", group_id).eq("user_id", target_id).execute()
+
+    notify_user(target_id, "group_ban", f"You have been banned from {group['title']}: {reason}", user["user_id"])
+    return {"ok": True}
+
+
+@api_router.put("/groups/{group_id}")
+def edit_group(group_id: str, payload: dict, user: dict = Depends(get_current_user)):
+    group = _maybe(sb.table("groups").select("creator_id").eq("group_id", group_id).maybe_single().execute())
+    if not group or group["creator_id"] != user["user_id"]:
+        raise HTTPException(403, "Only the creator can edit the group")
+
+    updates = {}
+    for field in ["title", "description", "rules", "join_cost"]:
+        if field in payload:
+            if field == "title":
+                if not payload["title"].strip():
+                    raise HTTPException(400)
+                updates["title"] = payload["title"].strip()
+            elif field == "join_cost":
+                cost = int(payload["join_cost"])
+                if cost < 0:
+                    raise HTTPException(400)
+                updates["join_cost"] = cost
+            else:
+                updates[field] = payload[field]
+
+    if "image" in payload:
+        img = payload["image"]
+        if img and (img.startswith("data:image") or "base64" in img):
+            compressed = compress_image(img)
+            filename = f"group_{uuid.uuid4().hex[:8]}.webp"
+            updates["image"] = upload_image_to_supabase(compressed, user["user_id"], filename)
+        else:
+            updates["image"] = img or ""
+
+    if updates:
+        updates["updated_at"] = datetime.now(timezone.utc).isoformat()
+        sb.table("groups").update(updates).eq("group_id", group_id).execute()
+
+    return {"ok": True}
+
+
+
+
+
+    
 app.include_router(api_router)
 
 if __name__ == "__main__":
