@@ -1809,38 +1809,41 @@ def list_groups(user: dict = Depends(get_current_user)):
     groups = sb.table("groups").select("*").execute().data or []
 
     for g in groups:
-        count_res = sb.table("group_members").select("user_id", count="exact").eq("group_id", g["group_id"]).execute()
-        g["member_count"] = count_res.count if hasattr(count_res, "count") else 0
+        members = sb.table("group_members").select("user_id").eq("group_id", g["group_id"]).execute().data or []
+        g["member_count"] = len(members)
 
     groups.sort(key=lambda x: x["member_count"], reverse=True)
 
     for g in groups:
-        member = sb.table("group_members").select("role").eq("group_id", g["group_id"]).eq("user_id", user["user_id"]).maybe_single().execute().data
-        g["my_role"] = member["role"] if member else None
+        member = sb.table("group_members").select("role").eq("group_id", g["group_id"]).eq("user_id", user["user_id"]).maybe_single().execute()
+        g["my_role"] = member.data["role"] if member.data else None
 
     return groups
 
-
 @api_router.get("/groups/{group_id}")
 def get_group(group_id: str, user: dict = Depends(get_current_user)):
-    group = _maybe(sb.table("groups").select("*").eq("group_id", group_id).maybe_single().execute())
+    group = sb.table("groups").select("*").eq("group_id", group_id).maybe_single().execute().data
     if not group:
         raise HTTPException(404, "Group not found")
 
+    # Members with roles
     members = sb.table("group_members").select("user_id,role").eq("group_id", group_id).execute().data or []
     for m in members:
-        profile = _maybe(sb.table("user_profiles").select("display_name,profile_image").eq("user_id", m["user_id"]).maybe_single().execute())
+        profile = sb.table("user_profiles").select("display_name,profile_image").eq("user_id", m["user_id"]).maybe_single().execute().data
         m["display_name"] = profile.get("display_name") if profile else "Unknown"
         m["profile_image"] = profile.get("profile_image") if profile else ""
 
     group["members"] = members
 
+    # Bans
     bans = sb.table("group_bans").select("*").eq("group_id", group_id).execute().data or []
     group["bans"] = bans
 
+    # Current user's role
     my_member = sb.table("group_members").select("role").eq("group_id", group_id).eq("user_id", user["user_id"]).maybe_single().execute().data
     group["my_role"] = my_member["role"] if my_member else None
 
+    # Check if banned
     ban = sb.table("group_bans").select("banned_until").eq("group_id", group_id).eq("user_id", user["user_id"]).maybe_single().execute().data
     group["am_i_banned"] = False
     if ban:
