@@ -1746,8 +1746,6 @@ def get_user_profile(user_id: str):
     return profile
 
 
-
-
 # ===================== GROUPS =====================
 
 @api_router.post("/groups")
@@ -1819,6 +1817,8 @@ def list_groups(user: dict = Depends(get_current_user)):
         g["my_role"] = member.get("role") if member else None
 
     return groups
+
+
 @api_router.get("/groups/{group_id}")
 def get_group(group_id: str, user: dict = Depends(get_current_user)):
     group = _maybe(sb.table("groups").select("*").eq("group_id", group_id).maybe_single().execute())
@@ -1850,8 +1850,6 @@ def get_group(group_id: str, user: dict = Depends(get_current_user)):
 
     return group
 
-    
-
 
 @api_router.post("/groups/{group_id}/join")
 def join_group(group_id: str, user: dict = Depends(get_current_user)):
@@ -1859,13 +1857,13 @@ def join_group(group_id: str, user: dict = Depends(get_current_user)):
     if not group:
         raise HTTPException(404, "Group not found")
 
-    existing = sb.table("group_members").select("role").eq("group_id", group_id).eq("user_id", user["user_id"]).maybe_single().execute().data
+    existing = _maybe(sb.table("group_members").select("role").eq("group_id", group_id).eq("user_id", user["user_id"]).maybe_single().execute())
     if existing:
         raise HTTPException(400, "Already a member")
 
-    ban = sb.table("group_bans").select("banned_until").eq("group_id", group_id).eq("user_id", user["user_id"]).maybe_single().execute().data
+    ban = _maybe(sb.table("group_bans").select("banned_until").eq("group_id", group_id).eq("user_id", user["user_id"]).maybe_single().execute())
     if ban:
-        if ban["banned_until"] is None or _parse_dt(ban["banned_until"]) > datetime.now(timezone.utc):
+        if ban.get("banned_until") is None or _parse_dt(ban["banned_until"]) > datetime.now(timezone.utc):
             raise HTTPException(403, "You are banned from this group")
 
     join_cost = group.get("join_cost", 0)
@@ -1892,17 +1890,17 @@ def remove_member(group_id: str, user_id: str, user: dict = Depends(get_current_
     if not group:
         raise HTTPException(404)
 
-    requester = sb.table("group_members").select("role").eq("group_id", group_id).eq("user_id", user["user_id"]).maybe_single().execute().data
+    requester = _maybe(sb.table("group_members").select("role").eq("group_id", group_id).eq("user_id", user["user_id"]).maybe_single().execute())
     if not requester:
         raise HTTPException(403, "You are not a member of this group")
 
-    if requester["role"] == "creator" and user_id != user["user_id"]:
+    if requester.get("role") == "creator" and user_id != user["user_id"]:
         sb.table("group_members").delete().eq("group_id", group_id).eq("user_id", user_id).execute()
         return {"ok": True}
 
-    if requester["role"] == "moderator":
-        target = sb.table("group_members").select("role").eq("group_id", group_id).eq("user_id", user_id).maybe_single().execute().data
-        if target and target["role"] not in ("creator", "moderator"):
+    if requester.get("role") == "moderator":
+        target = _maybe(sb.table("group_members").select("role").eq("group_id", group_id).eq("user_id", user_id).maybe_single().execute())
+        if target and target.get("role") not in ("creator", "moderator"):
             sb.table("group_members").delete().eq("group_id", group_id).eq("user_id", user_id).execute()
             return {"ok": True}
 
@@ -1920,7 +1918,7 @@ def change_member_role(group_id: str, user_id: str, payload: dict, user: dict = 
         raise HTTPException(400, "Invalid role")
 
     group = _maybe(sb.table("groups").select("creator_id").eq("group_id", group_id).maybe_single().execute())
-    if not group or group["creator_id"] != user["user_id"]:
+    if not group or group.get("creator_id") != user["user_id"]:
         raise HTTPException(403, "Only the group creator can change roles")
 
     sb.table("group_members").update({"role": new_role}).eq("group_id", group_id).eq("user_id", user_id).execute()
@@ -1935,17 +1933,17 @@ def send_group_message(group_id: str, payload: dict, user: dict = Depends(get_cu
     if contains_profanity(content):
         raise HTTPException(400, "Message contains inappropriate language")
 
-    member = sb.table("group_members").select("role").eq("group_id", group_id).eq("user_id", user["user_id"]).maybe_single().execute().data
+    member = _maybe(sb.table("group_members").select("role").eq("group_id", group_id).eq("user_id", user["user_id"]).maybe_single().execute())
     if not member:
         raise HTTPException(403, "You are not a member")
 
-    ban = sb.table("group_bans").select("banned_until").eq("group_id", group_id).eq("user_id", user["user_id"]).maybe_single().execute().data
-    if ban and (ban["banned_until"] is None or _parse_dt(ban["banned_until"]) > datetime.now(timezone.utc)):
+    ban = _maybe(sb.table("group_bans").select("banned_until").eq("group_id", group_id).eq("user_id", user["user_id"]).maybe_single().execute())
+    if ban and (ban.get("banned_until") is None or _parse_dt(ban["banned_until"]) > datetime.now(timezone.utc)):
         raise HTTPException(403, "You are banned")
 
     if not is_premium(user):
-        msg_count_res = sb.table("group_messages").select("message_id", count="exact").eq("group_id", group_id).eq("sender_id", user["user_id"]).execute()
-        msg_count = msg_count_res.count if hasattr(msg_count_res, 'count') else 0
+        msgs = sb.table("group_messages").select("message_id").eq("group_id", group_id).eq("sender_id", user["user_id"]).execute().data or []
+        msg_count = len(msgs)
         if msg_count >= 2:
             require_token(user, 1)
 
@@ -1963,7 +1961,7 @@ def send_group_message(group_id: str, payload: dict, user: dict = Depends(get_cu
 
 @api_router.get("/groups/{group_id}/messages")
 def get_group_messages(group_id: str, limit: int = 50, before: Optional[str] = None, user: dict = Depends(get_current_user)):
-    member = sb.table("group_members").select("role").eq("group_id", group_id).eq("user_id", user["user_id"]).maybe_single().execute().data
+    member = _maybe(sb.table("group_members").select("role").eq("group_id", group_id).eq("user_id", user["user_id"]).maybe_single().execute())
     if not member:
         raise HTTPException(403)
 
@@ -1986,12 +1984,12 @@ def delete_group_message(group_id: str, message_id: str, user: dict = Depends(ge
     if not msg:
         raise HTTPException(404)
 
-    if msg["sender_id"] == user["user_id"]:
+    if msg.get("sender_id") == user["user_id"]:
         sb.table("group_messages").update({"deleted": True}).eq("message_id", message_id).execute()
         return {"ok": True}
 
-    member = sb.table("group_members").select("role").eq("group_id", group_id).eq("user_id", user["user_id"]).maybe_single().execute().data
-    if not member or member["role"] not in ("creator", "moderator"):
+    member = _maybe(sb.table("group_members").select("role").eq("group_id", group_id).eq("user_id", user["user_id"]).maybe_single().execute())
+    if not member or member.get("role") not in ("creator", "moderator"):
         raise HTTPException(403, "Only moderators or creator can delete others' messages")
 
     sb.table("group_messages").update({"deleted": True}).eq("message_id", message_id).execute()
@@ -2001,7 +1999,7 @@ def delete_group_message(group_id: str, message_id: str, user: dict = Depends(ge
 @api_router.post("/groups/{group_id}/bans")
 def ban_user(group_id: str, payload: dict, user: dict = Depends(get_current_user)):
     group = _maybe(sb.table("groups").select("creator_id").eq("group_id", group_id).maybe_single().execute())
-    if not group or group["creator_id"] != user["user_id"]:
+    if not group or group.get("creator_id") != user["user_id"]:
         raise HTTPException(403, "Only the group creator can ban users")
 
     target_id = payload.get("user_id")
@@ -2032,7 +2030,7 @@ def ban_user(group_id: str, payload: dict, user: dict = Depends(get_current_user
 @api_router.put("/groups/{group_id}")
 def edit_group(group_id: str, payload: dict, user: dict = Depends(get_current_user)):
     group = _maybe(sb.table("groups").select("creator_id").eq("group_id", group_id).maybe_single().execute())
-    if not group or group["creator_id"] != user["user_id"]:
+    if not group or group.get("creator_id") != user["user_id"]:
         raise HTTPException(403, "Only the creator can edit the group")
 
     updates = {}
@@ -2064,7 +2062,6 @@ def edit_group(group_id: str, payload: dict, user: dict = Depends(get_current_us
         sb.table("groups").update(updates).eq("group_id", group_id).execute()
 
     return {"ok": True}
-
 
 
 
