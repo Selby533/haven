@@ -2063,7 +2063,139 @@ def edit_group(group_id: str, payload: dict, user: dict = Depends(get_current_us
 
     return {"ok": True}
 
+# ---------- Comments on group messages ----------
 
+@api_router.post("/groups/{group_id}/messages/{message_id}/comments")
+def create_group_comment(
+    group_id: str,
+    message_id: str,
+    payload: dict,
+    user: dict = Depends(get_current_user)
+):
+    content = payload.get("content", "")
+    parent_id = payload.get("parent_id")   # optional, for replies to replies
+
+    if not content.strip():
+        raise HTTPException(400, "Comment cannot be empty")
+    if contains_profanity(content):
+        raise HTTPException(400, "Comment contains inappropriate language")
+
+    # Verify user is a member and not banned
+    member = _maybe(sb.table("group_members").select("role")
+        .eq("group_id", group_id)
+        .eq("user_id", user["user_id"])
+        .maybe_single().execute())
+    if not member:
+        raise HTTPException(403, "You must be a member to comment")
+
+    ban = _maybe(sb.table("group_bans").select("banned_until")
+        .eq("group_id", group_id)
+        .eq("user_id", user["user_id"])
+        .maybe_single().execute())
+    if ban and (ban.get("banned_until") is None or _parse_dt(ban["banned_until"]) > datetime.now(timezone.utc)):
+        raise HTTPException(403, "You are banned")
+
+    # Verify the message exists in this group
+    msg = _maybe(sb.table("group_messages").select("message_id")
+        .eq("message_id", message_id)
+        .eq("group_id", group_id)
+        .maybe_single().execute())
+    if not msg:
+        raise HTTPException(404, "Message not found")
+
+    # If parent_id is given, verify it exists
+    if parent_id:
+        parent = _maybe(sb.table("group_message_comments").select("comment_id")
+            .eq("comment_id", parent_id)
+            .maybe_single().execute())
+        if not parent:
+            raise HTTPException(404, "Parent comment not found")
+
+    comment_id = f"gmc_{uuid.uuid4().hex[:12]}"
+    now = datetime.now(timezone.utc).isoformat()
+    sb.table("group_message_comments").insert({
+        "comment_id": comment_id,
+        "message_id": message_id,
+        "user_id": user["user_id"],
+        "content": content.strip(),
+        "parent_id": parent_id,
+        "created_at": now
+    }).execute()
+
+    # Notify the message author (optional)
+    original_author = _maybe(sb.table("group_messages").select("sender_id")
+        .eq("message_id", message_id).maybe_single().execute())
+    if original_author and original_author["sender_id"] != user["user_id"]:
+        notify_user(
+            original_author["sender_id"],
+            "group_comment",
+            f"Someone commented on your message in group {group_id}",
+            user["user_id"]
+        )
+
+    return {"ok": True, "comment_id": comment_id}
+
+
+@api_router.get("/groups/{group_id}/messages/{message_id}/comments")
+def get_group_comments(
+    group_id: str,
+    message_id: str,
+    user: dict = Depends(get_current_user)
+):
+    # Verify membership
+    member = _maybe(sb.table("group_members").select("role")
+        .eq("group_id", group_id)
+        .eq("user_id", user["user_id"])
+        .maybe_single().execute())
+    if not member:
+        raise HTTPException(403)
+
+    comments = sb.table("group_message_comments").select("*")\
+        .eq("message_id", message_id)\
+        .order("created_at")\
+        .execute().data or []
+
+    # Attach user names
+    for c in comments:
+        profile = _maybe(sb.table("users").select("name")
+            .eq("user_id", c["user_id"])
+            .maybe_single().execute())
+        c["author_name"] = profile.get("name") if profile else "Unknown"
+
+    # Build tree
+    tree = build_comment_tree(comments)   # reuse the same helper from stories
+    return tree
+
+
+@api_router.delete("/groups/{group_id}/messages/{message_id}/comments/{comment_id}")
+def delete_group_comment(
+    group_id: str,
+    message_id: str,
+    comment_id: str,
+    user: dict = Depends(get_current_user)
+):
+    # Fetch comment
+    comment = _maybe(sb.table("group_message_comments").select("*")
+        .eq("comment_id", comment_id)
+        .eq("message_id", message_id)
+        .maybe_single().execute())
+    if not comment:
+        raise HTTPException(404, "Comment not found")
+
+    # Permission: author, group creator, or moderator
+    if comment["user_id"] == user["user_id"]:
+        pass  # ok
+    else:
+        member = _maybe(sb.table("group_members").select("role")
+            .eq("group_id", group_id)
+            .eq("user_id", user["user_id"])
+            .maybe_single().execute())
+        if not member or member.get("role") not in ("creator", "moderator"):
+            raise HTTPException(403, "You cannot delete this comment")
+
+    # Delete (cascade will remove replies if FK is set)
+    sb.table("group_message_comments").delete().eq("comment_id", comment_id).execute()
+    return {"ok": True}
 
 
 
