@@ -2431,11 +2431,21 @@ def forgot_password(payload: dict):
     <a href="{reset_link}">{reset_link}</a>
     <p>This link expires in 1 hour.</p>
     """
-    send_email(email, "Reset your Haven password", body)
+
+    smtp_host = os.environ.get("SMTP_HOST")
+    if not smtp_host:
+        logger.info("Password reset link: " + reset_link)
+        return {"ok": True, "message": "If that email is registered, you'll receive a password reset link. (SMTP not configured, check logs)."}
+
+    def send_reset():
+        try:
+            send_email(email, "Reset your Haven password", body)
+        except Exception as e:
+            logger.error(f"Failed to send password reset email: {e}")
+
+    threading.Thread(target=send_reset).start()
 
     return {"ok": True, "message": "If that email is registered, you'll receive a password reset link."}
-
-
 # ---------- Reset Password ----------
 @api_router.post("/auth/reset-password")
 def reset_password(payload: dict):
