@@ -12,6 +12,8 @@ from PIL import Image
 import httpx as httpx_lib
 import uuid
 import bcrypt
+import threading   # add this at the very top of server.py if not already there
+
 
 ROOT_DIR = Path(__file__).parent
 load_dotenv(ROOT_DIR / '.env')
@@ -2277,6 +2279,8 @@ def send_email(to_email: str, subject: str, body: str):
 
 
 # ---------- Signup ----------
+
+
 @api_router.post("/auth/signup")
 def signup_email(payload: dict, request: Request, response: Response):
     email = payload.get("email", "").strip().lower()
@@ -2319,7 +2323,7 @@ def signup_email(payload: dict, request: Request, response: Response):
         "verified": False
     }).execute()
 
-    # Send verification email
+    # Prepare verification email, send in background to avoid delay
     verify_link = f"https://havenpositive.online/verify-email?token={verification_token}"
     body = f"""
     <h2>Welcome to Haven!</h2>
@@ -2327,10 +2331,23 @@ def signup_email(payload: dict, request: Request, response: Response):
     <a href="{verify_link}">{verify_link}</a>
     <p>This link expires in 24 hours.</p>
     """
-    send_email(email, "Verify your Haven account", body)
 
-    return {"ok": True, "message": "Account created. Please check your email to verify your account."}
+    # If SMTP is not configured, log the link and return immediately
+    smtp_host = os.environ.get("SMTP_HOST")
+    if not smtp_host:
+        logger.info("SMTP not configured – verification link: " + verify_link)
+        return {"ok": True, "message": "Account created. (SMTP not configured, check logs for verification link)."}
 
+    # Send email in a background thread so the request returns instantly
+    def send_verification():
+        try:
+            send_email(email, "Verify your Haven account", body)
+        except Exception as e:
+            logger.error(f"Failed to send verification email: {e}")
+
+    threading.Thread(target=send_verification).start()
+
+    return {"ok": True, "message": "Account created! Please check your email to verify."}
 
 # ---------- Login ----------
 @api_router.post("/auth/login")
