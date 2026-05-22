@@ -11,8 +11,7 @@ from datetime import datetime, timezone, timedelta
 from PIL import Image
 import httpx as httpx_lib
 import uuid
-from passlib.context import CryptContext
-
+import bcrypt
 
 ROOT_DIR = Path(__file__).parent
 load_dotenv(ROOT_DIR / '.env')
@@ -2244,8 +2243,7 @@ def delete_group_comment(
 
 
 # ===================== EMAIL / PASSWORD AUTH =====================
-
-pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
+# ===================== EMAIL / PASSWORD AUTH =====================
 
 # ---------- Email helper ----------
 def send_email(to_email: str, subject: str, body: str):
@@ -2297,7 +2295,10 @@ def signup_email(payload: dict, request: Request, response: Response):
             raise HTTPException(400, "An account with this email was deleted. Contact support.")
         raise HTTPException(400, "An account with this email already exists")
 
-    password_hash = pwd_context.hash(password)
+    # Truncate password to 72 bytes for bcrypt and hash directly
+    raw_password = password[:72].encode('utf-8')
+    password_hash = bcrypt.hashpw(raw_password, bcrypt.gensalt()).decode()
+
     user_id = f"user_{uuid.uuid4().hex[:12]}"
     now = datetime.now(timezone.utc).isoformat()
     verification_token = uuid.uuid4().hex
@@ -2344,7 +2345,11 @@ def login_email(payload: dict, request: Request, response: Response):
     if not user or not user.get("password_hash"):
         raise HTTPException(401, "Invalid email or password")
 
-    if not pwd_context.verify(password, user["password_hash"]):
+    # Verify password with direct bcrypt
+    try:
+        if not bcrypt.checkpw(password[:72].encode('utf-8'), user["password_hash"].encode()):
+            raise HTTPException(401, "Invalid email or password")
+    except Exception:
         raise HTTPException(401, "Invalid email or password")
 
     if not user.get("email_verified"):
@@ -2449,7 +2454,10 @@ def reset_password(payload: dict):
     if _parse_dt(user["reset_token_expires"]) < datetime.now(timezone.utc):
         raise HTTPException(400, "Reset token has expired")
 
-    new_hash = pwd_context.hash(new_password)
+    # Hash new password with direct bcrypt
+    raw_password = new_password[:72].encode('utf-8')
+    new_hash = bcrypt.hashpw(raw_password, bcrypt.gensalt()).decode()
+
     sb.table("users").update({
         "password_hash": new_hash,
         "reset_token": None,
