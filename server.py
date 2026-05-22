@@ -2246,40 +2246,47 @@ def delete_group_comment(
 
 # ===================== EMAIL / PASSWORD AUTH =====================
 # ===================== EMAIL / PASSWORD AUTH =====================
-
-# ---------- Email helper ----------
+# ===================== EMAIL / PASSWORD AUTH =====================
 # ===================== EMAIL / PASSWORD AUTH =====================
 
-# ---------- Email helper ----------
+# ---------- Email helper (Brevo HTTP API) ----------
 def send_email(to_email: str, subject: str, body: str):
-    smtp_host = os.environ.get("SMTP_HOST")
-    smtp_port = os.environ.get("SMTP_PORT")
-    smtp_user = os.environ.get("SMTP_USER")
-    smtp_password = os.environ.get("SMTP_PASSWORD")
+    """
+    Send a transactional email via Brevo's HTTP REST API (port 443).
+    This avoids the SMTP block on Render's free tier.
+    """
+    brevo_api_key = os.environ.get("BREVO_API_KEY")
     smtp_from = os.environ.get("SMTP_FROM", "noreply@havenpositive.online")
 
-    if not smtp_host:
-        logger.info(f"Email not sent (SMTP not configured): To={to_email}, Subject={subject}")
-        logger.info(f"Body: {body}")
+    if not brevo_api_key:
+        logger.info(f"Brevo API key not configured – email not sent. To={to_email}, Subject={subject}")
         return
 
-    import smtplib
-    from email.mime.text import MIMEText
-
-    msg = MIMEText(body, "html")
-    msg["Subject"] = subject
-    msg["From"] = smtp_from
-    msg["To"] = to_email
+    payload = {
+        "sender": {"name": "Haven", "email": smtp_from},
+        "to": [{"email": to_email}],
+        "subject": subject,
+        "htmlContent": body,
+    }
 
     try:
-        server = smtplib.SMTP(smtp_host, int(smtp_port))
-        server.starttls()
-        server.login(smtp_user, smtp_password)
-        server.sendmail(smtp_from, [to_email], msg.as_string())
-        server.quit()
+        resp = httpx.post(
+            "https://api.brevo.com/v3/smtp/email",
+            json=payload,
+            headers={
+                "api-key": brevo_api_key,
+                "Content-Type": "application/json",
+                "Accept": "application/json",
+            },
+            timeout=10.0,
+        )
+        if resp.status_code not in (200, 201, 202):
+            logger.error(f"Brevo API error {resp.status_code}: {resp.text}")
+            raise Exception(f"Brevo API returned {resp.status_code}")
+        logger.info(f"Email sent to {to_email} via Brevo API")
     except Exception as e:
         logger.error(f"Failed to send email to {to_email}: {e}")
-        raise   # <-- Re-raise to surface the error
+        raise
 
 
 # ---------- Signup ----------
@@ -2295,13 +2302,15 @@ def signup_email(payload: dict, request: Request, response: Response):
         raise HTTPException(400, "Password must be at least 6 characters")
 
     # Check if email already exists
-    existing = _maybe(sb.table("users").select("user_id,deleted").eq("email", email).maybe_single().execute())
+    existing = _maybe(
+        sb.table("users").select("user_id,deleted").eq("email", email).maybe_single().execute()
+    )
     if existing:
         if existing.get("deleted"):
             raise HTTPException(400, "An account with this email was deleted. Contact support.")
         raise HTTPException(400, "An account with this email already exists")
 
-    raw_password = password[:72].encode('utf-8')
+    raw_password = password[:72].encode("utf-8")
     password_hash = bcrypt.hashpw(raw_password, bcrypt.gensalt()).decode()
 
     user_id = f"user_{uuid.uuid4().hex[:12]}"
@@ -2310,21 +2319,15 @@ def signup_email(payload: dict, request: Request, response: Response):
     verification_expires = (datetime.now(timezone.utc) + timedelta(hours=24)).isoformat()
 
     sb.table("users").insert({
-        "user_id": user_id,
-        "email": email,
-        "name": name,
-        "password_hash": password_hash,
-        "email_verified": False,
+        "user_id": user_id, "email": email, "name": name,
+        "password_hash": password_hash, "email_verified": False,
         "verification_token": verification_token,
         "verification_token_expires": verification_expires,
-        "created_at": now,
-        "last_active": now,
-        "tokens": 100,
-        "diamonds": 5,
-        "verified": False
+        "created_at": now, "last_active": now,
+        "tokens": 100, "diamonds": 5, "verified": False,
     }).execute()
 
-    # ---- SYNCHRONOUS EMAIL (will show error immediately if it fails) ----
+    # ---- Send verification email via Brevo HTTP API (in background) ----
     verify_link = f"https://havenpositive.online/verify-email?token={verification_token}"
     body = f"""
     <h2>Welcome to Haven!</h2>
@@ -2333,15 +2336,19 @@ def signup_email(payload: dict, request: Request, response: Response):
     <p>This link expires in 24 hours.</p>
     """
 
-    smtp_host = os.environ.get("SMTP_HOST")
-    if not smtp_host:
-        logger.info("SMTP not configured – verification link: " + verify_link)
-        return {"ok": True, "message": "Account created. (SMTP not configured, check logs for verification link)."}
+    # ALWAYS log the link as a fallback
+    logger.info("=" * 60)
+    logger.info("VERIFICATION LINK: " + verify_link)
+    logger.info("=" * 60)
 
-    try:
-        send_email(email, "Verify your Haven account", body)
-    except Exception as e:
-        raise HTTPException(500, f"Email sending failed: {str(e)}")
+    # Send email in background thread so the request returns instantly
+    def send_verification():
+        try:
+            send_email(email, "Verify your Haven account", body)
+        except Exception as e:
+            logger.error(f"Failed to send verification email: {e}")
+
+    threading.Thread(target=send_verification).start()
 
     return {"ok": True, "message": "Account created! Please check your email to verify."}
 
@@ -2355,12 +2362,14 @@ def login_email(payload: dict, request: Request, response: Response):
     if not email or not password:
         raise HTTPException(400, "Email and password required")
 
-    user = _maybe(sb.table("users").select("*").eq("email", email).eq("deleted", False).maybe_single().execute())
+    user = _maybe(
+        sb.table("users").select("*").eq("email", email).eq("deleted", False).maybe_single().execute()
+    )
     if not user or not user.get("password_hash"):
         raise HTTPException(401, "Invalid email or password")
 
     try:
-        if not bcrypt.checkpw(password[:72].encode('utf-8'), user["password_hash"].encode()):
+        if not bcrypt.checkpw(password[:72].encode("utf-8"), user["password_hash"].encode()):
             raise HTTPException(401, "Invalid email or password")
     except Exception:
         raise HTTPException(401, "Invalid email or password")
@@ -2371,22 +2380,15 @@ def login_email(payload: dict, request: Request, response: Response):
     session_token = f"session_{uuid.uuid4().hex[:32]}"
     expires_at = datetime.now(timezone.utc) + timedelta(days=7)
     sb.table("user_sessions").upsert({
-        "session_token": session_token,
-        "user_id": user["user_id"],
-        "expires_at": expires_at.isoformat(),
-        "created_at": datetime.now(timezone.utc).isoformat()
+        "session_token": session_token, "user_id": user["user_id"],
+        "expires_at": expires_at.isoformat(), "created_at": datetime.now(timezone.utc).isoformat()
     }).execute()
 
     sb.table("users").update({"last_active": datetime.now(timezone.utc).isoformat()}).eq("user_id", user["user_id"]).execute()
 
     response.set_cookie(
-        key="session_token",
-        value=session_token,
-        httponly=True,
-        secure=request.url.scheme == "https",
-        samesite="lax",
-        path="/",
-        max_age=7*24*60*60
+        key="session_token", value=session_token, httponly=True,
+        secure=request.url.scheme == "https", samesite="lax", path="/", max_age=7*24*60*60,
     )
     return {"ok": True, "user_id": user["user_id"], "token": session_token}
 
@@ -2401,17 +2403,13 @@ def verify_email(payload: dict):
     user = _maybe(sb.table("users").select("*").eq("verification_token", token).maybe_single().execute())
     if not user:
         raise HTTPException(400, "Invalid or expired token")
-
     if user.get("email_verified"):
         return {"ok": True, "message": "Email already verified"}
-
     if _parse_dt(user["verification_token_expires"]) < datetime.now(timezone.utc):
         raise HTTPException(400, "Verification token has expired. Please sign up again.")
 
     sb.table("users").update({
-        "email_verified": True,
-        "verification_token": None,
-        "verification_token_expires": None
+        "email_verified": True, "verification_token": None, "verification_token_expires": None
     }).eq("user_id", user["user_id"]).execute()
 
     return {"ok": True, "message": "Email verified! You can now log in."}
@@ -2430,10 +2428,8 @@ def forgot_password(payload: dict):
 
     reset_token = uuid.uuid4().hex
     reset_expires = (datetime.now(timezone.utc) + timedelta(hours=1)).isoformat()
-
     sb.table("users").update({
-        "reset_token": reset_token,
-        "reset_token_expires": reset_expires
+        "reset_token": reset_token, "reset_token_expires": reset_expires
     }).eq("user_id", user["user_id"]).execute()
 
     reset_link = f"https://havenpositive.online/reset-password?token={reset_token}"
@@ -2443,18 +2439,11 @@ def forgot_password(payload: dict):
     <a href="{reset_link}">{reset_link}</a>
     <p>This link expires in 1 hour.</p>
     """
-
-    smtp_host = os.environ.get("SMTP_HOST")
-    if not smtp_host:
-        logger.info("Password reset link: " + reset_link)
-        return {"ok": True, "message": "If that email is registered, you'll receive a password reset link. (SMTP not configured, check logs)."}
+    logger.info("PASSWORD RESET LINK: " + reset_link)
 
     def send_reset():
-        try:
-            send_email(email, "Reset your Haven password", body)
-        except Exception as e:
-            logger.error(f"Failed to send password reset email: {e}")
-
+        try: send_email(email, "Reset your Haven password", body)
+        except Exception as e: logger.error(f"Failed to send password reset email: {e}")
     threading.Thread(target=send_reset).start()
 
     return {"ok": True, "message": "If that email is registered, you'll receive a password reset link."}
@@ -2465,7 +2454,6 @@ def forgot_password(payload: dict):
 def reset_password(payload: dict):
     token = payload.get("token", "")
     new_password = payload.get("password", "")
-
     if not token or not new_password:
         raise HTTPException(400, "Token and new password required")
     if len(new_password) < 6:
@@ -2474,17 +2462,13 @@ def reset_password(payload: dict):
     user = _maybe(sb.table("users").select("*").eq("reset_token", token).maybe_single().execute())
     if not user:
         raise HTTPException(400, "Invalid or expired token")
-
     if _parse_dt(user["reset_token_expires"]) < datetime.now(timezone.utc):
         raise HTTPException(400, "Reset token has expired")
 
-    raw_password = new_password[:72].encode('utf-8')
+    raw_password = new_password[:72].encode("utf-8")
     new_hash = bcrypt.hashpw(raw_password, bcrypt.gensalt()).decode()
-
     sb.table("users").update({
-        "password_hash": new_hash,
-        "reset_token": None,
-        "reset_token_expires": None
+        "password_hash": new_hash, "reset_token": None, "reset_token_expires": None
     }).eq("user_id", user["user_id"]).execute()
 
     return {"ok": True, "message": "Password reset successfully. You can now log in."}
@@ -2493,6 +2477,6 @@ app.include_router(api_router)
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=int(os.environ.get("PORT",8000)))
+    uvicorn.run(app, host="0.0.0.0", port=int(os.environ.get("PORT",8000)))  
     
   
