@@ -2248,6 +2248,9 @@ def delete_group_comment(
 # ===================== EMAIL / PASSWORD AUTH =====================
 
 # ---------- Email helper ----------
+# ===================== EMAIL / PASSWORD AUTH =====================
+
+# ---------- Email helper ----------
 def send_email(to_email: str, subject: str, body: str):
     smtp_host = os.environ.get("SMTP_HOST")
     smtp_port = os.environ.get("SMTP_PORT")
@@ -2276,11 +2279,10 @@ def send_email(to_email: str, subject: str, body: str):
         server.quit()
     except Exception as e:
         logger.error(f"Failed to send email to {to_email}: {e}")
+        raise   # <-- Re-raise to surface the error
 
 
 # ---------- Signup ----------
-
-
 @api_router.post("/auth/signup")
 def signup_email(payload: dict, request: Request, response: Response):
     email = payload.get("email", "").strip().lower()
@@ -2299,7 +2301,6 @@ def signup_email(payload: dict, request: Request, response: Response):
             raise HTTPException(400, "An account with this email was deleted. Contact support.")
         raise HTTPException(400, "An account with this email already exists")
 
-    # Truncate password to 72 bytes for bcrypt and hash directly
     raw_password = password[:72].encode('utf-8')
     password_hash = bcrypt.hashpw(raw_password, bcrypt.gensalt()).decode()
 
@@ -2323,7 +2324,7 @@ def signup_email(payload: dict, request: Request, response: Response):
         "verified": False
     }).execute()
 
-    # Prepare verification email, send in background to avoid delay
+    # ---- SYNCHRONOUS EMAIL (will show error immediately if it fails) ----
     verify_link = f"https://havenpositive.online/verify-email?token={verification_token}"
     body = f"""
     <h2>Welcome to Haven!</h2>
@@ -2332,22 +2333,18 @@ def signup_email(payload: dict, request: Request, response: Response):
     <p>This link expires in 24 hours.</p>
     """
 
-    # If SMTP is not configured, log the link and return immediately
     smtp_host = os.environ.get("SMTP_HOST")
     if not smtp_host:
         logger.info("SMTP not configured – verification link: " + verify_link)
         return {"ok": True, "message": "Account created. (SMTP not configured, check logs for verification link)."}
 
-    # Send email in a background thread so the request returns instantly
-    def send_verification():
-        try:
-            send_email(email, "Verify your Haven account", body)
-        except Exception as e:
-            logger.error(f"Failed to send verification email: {e}")
-
-    threading.Thread(target=send_verification).start()
+    try:
+        send_email(email, "Verify your Haven account", body)
+    except Exception as e:
+        raise HTTPException(500, f"Email sending failed: {str(e)}")
 
     return {"ok": True, "message": "Account created! Please check your email to verify."}
+
 
 # ---------- Login ----------
 @api_router.post("/auth/login")
@@ -2362,7 +2359,6 @@ def login_email(payload: dict, request: Request, response: Response):
     if not user or not user.get("password_hash"):
         raise HTTPException(401, "Invalid email or password")
 
-    # Verify password with direct bcrypt
     try:
         if not bcrypt.checkpw(password[:72].encode('utf-8'), user["password_hash"].encode()):
             raise HTTPException(401, "Invalid email or password")
@@ -2372,7 +2368,6 @@ def login_email(payload: dict, request: Request, response: Response):
     if not user.get("email_verified"):
         raise HTTPException(403, "Please verify your email before logging in. Check your inbox.")
 
-    # Create session
     session_token = f"session_{uuid.uuid4().hex[:32]}"
     expires_at = datetime.now(timezone.utc) + timedelta(days=7)
     sb.table("user_sessions").upsert({
@@ -2463,6 +2458,8 @@ def forgot_password(payload: dict):
     threading.Thread(target=send_reset).start()
 
     return {"ok": True, "message": "If that email is registered, you'll receive a password reset link."}
+
+
 # ---------- Reset Password ----------
 @api_router.post("/auth/reset-password")
 def reset_password(payload: dict):
@@ -2481,7 +2478,6 @@ def reset_password(payload: dict):
     if _parse_dt(user["reset_token_expires"]) < datetime.now(timezone.utc):
         raise HTTPException(400, "Reset token has expired")
 
-    # Hash new password with direct bcrypt
     raw_password = new_password[:72].encode('utf-8')
     new_hash = bcrypt.hashpw(raw_password, bcrypt.gensalt()).decode()
 
@@ -2492,7 +2488,6 @@ def reset_password(payload: dict):
     }).eq("user_id", user["user_id"]).execute()
 
     return {"ok": True, "message": "Password reset successfully. You can now log in."}
-
 
 app.include_router(api_router)
 
