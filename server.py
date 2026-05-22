@@ -11,6 +11,9 @@ from datetime import datetime, timezone, timedelta
 from PIL import Image
 import httpx as httpx_lib
 import uuid
+from passlib.context import CryptContext
+
+
 ROOT_DIR = Path(__file__).parent
 load_dotenv(ROOT_DIR / '.env')
 
@@ -2239,6 +2242,221 @@ def delete_group_comment(
     sb.table("group_message_comments").delete().eq("comment_id", comment_id).execute()
     return {"ok": True}
 
+
+# ===================== EMAIL / PASSWORD AUTH =====================
+
+pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
+
+# ---------- Email helper ----------
+def send_email(to_email: str, subject: str, body: str):
+    smtp_host = os.environ.get("SMTP_HOST")
+    smtp_port = os.environ.get("SMTP_PORT")
+    smtp_user = os.environ.get("SMTP_USER")
+    smtp_password = os.environ.get("SMTP_PASSWORD")
+    smtp_from = os.environ.get("SMTP_FROM", "noreply@havenpositive.online")
+
+    if not smtp_host:
+        logger.info(f"Email not sent (SMTP not configured): To={to_email}, Subject={subject}")
+        logger.info(f"Body: {body}")
+        return
+
+    import smtplib
+    from email.mime.text import MIMEText
+
+    msg = MIMEText(body, "html")
+    msg["Subject"] = subject
+    msg["From"] = smtp_from
+    msg["To"] = to_email
+
+    try:
+        server = smtplib.SMTP(smtp_host, int(smtp_port))
+        server.starttls()
+        server.login(smtp_user, smtp_password)
+        server.sendmail(smtp_from, [to_email], msg.as_string())
+        server.quit()
+    except Exception as e:
+        logger.error(f"Failed to send email to {to_email}: {e}")
+
+
+# ---------- Signup ----------
+@api_router.post("/auth/signup")
+def signup_email(payload: dict, request: Request, response: Response):
+    email = payload.get("email", "").strip().lower()
+    password = payload.get("password", "")
+    name = payload.get("name", email.split("@")[0])
+
+    if not email or not password:
+        raise HTTPException(400, "Email and password required")
+    if len(password) < 6:
+        raise HTTPException(400, "Password must be at least 6 characters")
+
+    # Check if email already exists
+    existing = _maybe(sb.table("users").select("user_id,deleted").eq("email", email).maybe_single().execute())
+    if existing:
+        if existing.get("deleted"):
+            raise HTTPException(400, "An account with this email was deleted. Contact support.")
+        raise HTTPException(400, "An account with this email already exists")
+
+    password_hash = pwd_context.hash(password)
+    user_id = f"user_{uuid.uuid4().hex[:12]}"
+    now = datetime.now(timezone.utc).isoformat()
+    verification_token = uuid.uuid4().hex
+    verification_expires = (datetime.now(timezone.utc) + timedelta(hours=24)).isoformat()
+
+    sb.table("users").insert({
+        "user_id": user_id,
+        "email": email,
+        "name": name,
+        "password_hash": password_hash,
+        "email_verified": False,
+        "verification_token": verification_token,
+        "verification_token_expires": verification_expires,
+        "created_at": now,
+        "last_active": now,
+        "tokens": 100,
+        "diamonds": 5,
+        "verified": False
+    }).execute()
+
+    # Send verification email
+    verify_link = f"https://havenpositive.online/verify-email?token={verification_token}"
+    body = f"""
+    <h2>Welcome to Haven!</h2>
+    <p>Please verify your email by clicking the link below:</p>
+    <a href="{verify_link}">{verify_link}</a>
+    <p>This link expires in 24 hours.</p>
+    """
+    send_email(email, "Verify your Haven account", body)
+
+    return {"ok": True, "message": "Account created. Please check your email to verify your account."}
+
+
+# ---------- Login ----------
+@api_router.post("/auth/login")
+def login_email(payload: dict, request: Request, response: Response):
+    email = payload.get("email", "").strip().lower()
+    password = payload.get("password", "")
+
+    if not email or not password:
+        raise HTTPException(400, "Email and password required")
+
+    user = _maybe(sb.table("users").select("*").eq("email", email).eq("deleted", False).maybe_single().execute())
+    if not user or not user.get("password_hash"):
+        raise HTTPException(401, "Invalid email or password")
+
+    if not pwd_context.verify(password, user["password_hash"]):
+        raise HTTPException(401, "Invalid email or password")
+
+    if not user.get("email_verified"):
+        raise HTTPException(403, "Please verify your email before logging in. Check your inbox.")
+
+    # Create session
+    session_token = f"session_{uuid.uuid4().hex[:32]}"
+    expires_at = datetime.now(timezone.utc) + timedelta(days=7)
+    sb.table("user_sessions").upsert({
+        "session_token": session_token,
+        "user_id": user["user_id"],
+        "expires_at": expires_at.isoformat(),
+        "created_at": datetime.now(timezone.utc).isoformat()
+    }).execute()
+
+    sb.table("users").update({"last_active": datetime.now(timezone.utc).isoformat()}).eq("user_id", user["user_id"]).execute()
+
+    response.set_cookie(
+        key="session_token",
+        value=session_token,
+        httponly=True,
+        secure=request.url.scheme == "https",
+        samesite="lax",
+        path="/",
+        max_age=7*24*60*60
+    )
+    return {"ok": True, "user_id": user["user_id"], "token": session_token}
+
+
+# ---------- Verify Email ----------
+@api_router.post("/auth/verify-email")
+def verify_email(payload: dict):
+    token = payload.get("token", "")
+    if not token:
+        raise HTTPException(400, "Missing verification token")
+
+    user = _maybe(sb.table("users").select("*").eq("verification_token", token).maybe_single().execute())
+    if not user:
+        raise HTTPException(400, "Invalid or expired token")
+
+    if user.get("email_verified"):
+        return {"ok": True, "message": "Email already verified"}
+
+    if _parse_dt(user["verification_token_expires"]) < datetime.now(timezone.utc):
+        raise HTTPException(400, "Verification token has expired. Please sign up again.")
+
+    sb.table("users").update({
+        "email_verified": True,
+        "verification_token": None,
+        "verification_token_expires": None
+    }).eq("user_id", user["user_id"]).execute()
+
+    return {"ok": True, "message": "Email verified! You can now log in."}
+
+
+# ---------- Forgot Password ----------
+@api_router.post("/auth/forgot-password")
+def forgot_password(payload: dict):
+    email = payload.get("email", "").strip().lower()
+    if not email:
+        raise HTTPException(400, "Email required")
+
+    user = _maybe(sb.table("users").select("*").eq("email", email).eq("deleted", False).maybe_single().execute())
+    if not user:
+        return {"ok": True, "message": "If that email is registered, you'll receive a password reset link."}
+
+    reset_token = uuid.uuid4().hex
+    reset_expires = (datetime.now(timezone.utc) + timedelta(hours=1)).isoformat()
+
+    sb.table("users").update({
+        "reset_token": reset_token,
+        "reset_token_expires": reset_expires
+    }).eq("user_id", user["user_id"]).execute()
+
+    reset_link = f"https://havenpositive.online/reset-password?token={reset_token}"
+    body = f"""
+    <h2>Password Reset</h2>
+    <p>Click the link below to reset your password:</p>
+    <a href="{reset_link}">{reset_link}</a>
+    <p>This link expires in 1 hour.</p>
+    """
+    send_email(email, "Reset your Haven password", body)
+
+    return {"ok": True, "message": "If that email is registered, you'll receive a password reset link."}
+
+
+# ---------- Reset Password ----------
+@api_router.post("/auth/reset-password")
+def reset_password(payload: dict):
+    token = payload.get("token", "")
+    new_password = payload.get("password", "")
+
+    if not token or not new_password:
+        raise HTTPException(400, "Token and new password required")
+    if len(new_password) < 6:
+        raise HTTPException(400, "Password must be at least 6 characters")
+
+    user = _maybe(sb.table("users").select("*").eq("reset_token", token).maybe_single().execute())
+    if not user:
+        raise HTTPException(400, "Invalid or expired token")
+
+    if _parse_dt(user["reset_token_expires"]) < datetime.now(timezone.utc):
+        raise HTTPException(400, "Reset token has expired")
+
+    new_hash = pwd_context.hash(new_password)
+    sb.table("users").update({
+        "password_hash": new_hash,
+        "reset_token": None,
+        "reset_token_expires": None
+    }).eq("user_id", user["user_id"]).execute()
+
+    return {"ok": True, "message": "Password reset successfully. You can now log in."}
 
 
 app.include_router(api_router)
