@@ -4,6 +4,7 @@ from dotenv import load_dotenv
 from starlette.middleware.cors import CORSMiddleware
 from supabase import create_client, Client
 import os, logging, uuid, random, math, httpx, io, base64, time
+import json 
 from pathlib import Path
 from pydantic import BaseModel
 from typing import Optional, List, Dict
