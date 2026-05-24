@@ -2537,9 +2537,11 @@ def verify_google_purchase(payload: dict, user: dict = Depends(get_current_user)
             return {"ok": True, "diamonds": new_diamonds}
         else:
             raise HTTPException(400, "Purchase not valid or already consumed")
-    except Exception as e:
-        logger.error(f"Google Play verification failed: {e}")
-        raise HTTPException(400, "Purchase verification failed")
+except Exception as e:
+    # Log full traceback for debugging
+    logger.exception("Google Play verification failed")
+    # Return the actual error to the Flutter client (visible in toast or logs)
+    raise HTTPException(400, f"Purchase verification failed: {str(e)}")
 
 
 app.include_router(api_router)
