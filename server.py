@@ -365,6 +365,7 @@ def auth_me(user: dict = Depends(get_current_user)):
         "premium_expires_at": user.get("premium_expires_at"),
         "auto_renew": user.get("auto_renew", False),
         "privacy_accepted": user.get("privacy_accepted_at") is not None,
+        "created_at": user.get("created_at"), 
     }
 
 @api_router.post("/accept-privacy")
