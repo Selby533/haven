@@ -2326,7 +2326,7 @@ def signup_email(payload: dict, request: Request, response: Response):
         "verification_token": verification_token,
         "verification_token_expires": verification_expires,
         "created_at": now, "last_active": now,
-        "tokens": 100, "diamonds": 5, "verified": False,
+        "tokens": 35, "diamonds": 5, "verified": False,
     }).execute()
 
     # ---- Send verification email via Brevo HTTP API (in background) ----
