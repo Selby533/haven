@@ -214,7 +214,7 @@ class ProfileSetupPayload(BaseModel):
     profile_image: Optional[str] = ""; gallery_images: Optional[List[str]] = []
     pref_gender: Optional[str] = ""; pref_min_age: Optional[int] = 18
     pref_max_age: Optional[int] = 99; pref_country: Optional[str] = ""
-    pref_max_distance: Optional[int] = 50; pref_health_status: Optional[str] = ""
+    pref_max_distance: Optional[int] = 5000; pref_health_status: Optional[str] = ""
     pref_sexual_orientation: Optional[str] = ""
     profile_hidden: Optional[bool] = False
     hide_from_min_age: Optional[int] = None; hide_from_max_age: Optional[int] = None
@@ -332,7 +332,7 @@ def auth_google(payload: GoogleAuthPayload, request: Request, response: Response
             sb.table("users").insert({
                 "user_id": user_id, "email": email, "name": name, "picture": picture,
                 "created_at": now_iso, "last_active": now_iso,
-                "tokens": 35, "diamonds": 5, "verified": False
+                "tokens": 40, "diamonds": 5, "verified": False
             }).execute()
     expires_at = datetime.now(timezone.utc) + timedelta(days=7)
     sb.table("user_sessions").upsert({"session_token": session_token, "user_id": user_id, "expires_at": expires_at.isoformat(), "created_at": now_iso}).execute()
