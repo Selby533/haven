@@ -13,7 +13,7 @@ from PIL import Image
 # ---------- Enable HEIC/HEIF support for Pillow ----------
 try:
     import pillow_heif
-    pillow_heif.register()
+    pillow_heif.register_heif_opener()
 except ImportError:
     pass  # HEIC uploads will fail gracefully (400 error) if not installed
 
