@@ -1118,8 +1118,10 @@ def get_discover_profiles(
 
     # Select only needed columns for discovery
     query = sb.table("user_profiles").select(
-        "user_id,display_name,date_of_birth,profile_image,gender,country,city,gps_latitude,gps_longitude,health_status,sexual_orientation,religion,ethnicity,height,bio,interests,looking_for,education,kids,want_kids,smoke,drink,employment,profile_hidden,visible_to,lock_all_images,pref_gender,pref_health_status,pref_sexual_orientation,pref_country,pref_max_distance,pref_min_age,pref_max_age,hide_from_min_age,hide_from_max_age,hide_from_health_statuses,onboarding_complete,location_source,gps_verified_at,latitude,longitude,updated_at",
+        "user_id,display_name,date_of_birth,profile_image,gallery_images,gender,country,city,gps_latitude,gps_longitude,health_status,sexual_orientation,religion,ethnicity,height,bio,interests,looking_for,education,kids,want_kids,smoke,drink,employment,profile_hidden,visible_to,lock_all_images,pref_gender,pref_health_status,pref_sexual_orientation,pref_country,pref_max_distance,pref_min_age,pref_max_age,hide_from_min_age,hide_from_max_age,hide_from_health_statuses,onboarding_complete,location_source,gps_verified_at,latitude,longitude,updated_at",
         count="exact"
+        
+        
     ).neq("user_id", user["user_id"]) \
      .eq("onboarding_complete", True) \
      .not_.is_("gps_latitude", None) \
