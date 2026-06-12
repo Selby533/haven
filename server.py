@@ -1383,6 +1383,17 @@ def mark_notifications_read(user: dict = Depends(get_current_user)):
     sb.table("notifications").update({"read": True}).eq("user_id", user["user_id"]).eq("read", False).execute()
     return {"ok": True}
 
+@api_router.get("/notifications/unread-count")
+def get_unread_notification_count(user: dict = Depends(get_current_user)):
+    """Lightweight unread count – uses DB index for speed."""
+    res = sb.table("notifications") \
+        .select("notification_id", count="exact") \
+        .eq("user_id", user["user_id"]) \
+        .eq("read", False) \
+        .execute()
+    count = res.count if hasattr(res, 'count') else 0
+    return {"unread": count}
+
 @api_router.get("/unread-counts")
 def get_unread_counts(user: dict = Depends(get_current_user)):
     unread_msgs = sb.table("match_messages").select("match_id").neq("sender_id", user["user_id"]).eq("read", False).execute().data or []
