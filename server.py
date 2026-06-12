@@ -17,7 +17,6 @@ try:
 except ImportError:
     pass  # HEIC uploads will fail gracefully (400 error) if not installed
 
-
 import bcrypt
 import threading
 from contextlib import asynccontextmanager
@@ -385,7 +384,8 @@ def get_current_user(
     session = _maybe(res)
     if not session: raise HTTPException(status_code=401, detail="Invalid session")
     if _parse_dt(session["expires_at"]) < datetime.now(timezone.utc): raise HTTPException(status_code=401)
-    user = _maybe(sb.table("users").select("user_id,email,name,picture,verified,premium_tier,premium_expires_at,auto_renew,tokens,diamonds,privacy_accepted_at,created_at,last_active,deleted").eq("user_id", session["user_id"]).maybe_single().execute())
+    # --- FIX: add is_admin to the select columns ---
+    user = _maybe(sb.table("users").select("user_id,email,name,picture,verified,premium_tier,premium_expires_at,auto_renew,tokens,diamonds,privacy_accepted_at,created_at,last_active,deleted,is_admin").eq("user_id", session["user_id"]).maybe_single().execute())
     if not user: raise HTTPException(status_code=401, detail="User not found")
     if user.get("deleted"):
         raise HTTPException(status_code=401, detail="Account deleted")
