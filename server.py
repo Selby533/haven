@@ -776,6 +776,28 @@ def earn_tokens_ad(user: dict = Depends(get_current_user)):
     sb.table("users").update({"tokens": new_tokens, "last_ad_token_earned": datetime.now(timezone.utc).isoformat()}).eq("user_id", user["user_id"]).execute()
     return {"ok": True, "tokens_awarded": 2, "total_tokens": new_tokens}
 
+# ---------- Earn tokens ----------
+# ... existing earn_tokens and earn_tokens_ad ...
+
+@api_router.post("/earn-tokens-rewarded")
+def earn_tokens_rewarded(user: dict = Depends(get_current_user)):
+    """Rewarded ad – gives 7 tokens, same cooldown as regular ad earning."""
+    if is_premium(user):
+        raise HTTPException(400, "Premium members don't earn tokens")
+    last_earn = user.get("last_ad_token_earned")
+    if last_earn:
+        last = _parse_dt(last_earn)
+        if datetime.now(timezone.utc) - last < timedelta(seconds=30):
+            raise HTTPException(400, "You can earn ad tokens again in 30 seconds")
+    new_tokens = user.get("tokens", 0) + 7
+    sb.table("users").update({
+        "tokens": new_tokens,
+        "last_ad_token_earned": datetime.now(timezone.utc).isoformat()
+    }).eq("user_id", user["user_id"]).execute()
+    return {"ok": True, "tokens_awarded": 7, "total_tokens": new_tokens}
+
+
+
 # ---------- Location ----------
 @api_router.post("/location/update")
 async def update_location(payload: LocationUpdatePayload, user: dict = Depends(get_current_user)):
