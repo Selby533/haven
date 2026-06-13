@@ -797,6 +797,27 @@ def earn_tokens_rewarded(user: dict = Depends(get_current_user)):
     return {"ok": True, "tokens_awarded": 7, "total_tokens": new_tokens}
 
 
+@api_router.post("/spend-tokens")
+def spend_tokens_endpoint(amount: int = 1, user: dict = Depends(get_current_user)):
+    """
+    Spend multiple tokens at once – called when user has viewed several profiles.
+    Premium users are not charged.
+    """
+    if is_premium(user):
+        return {"ok": True, "spent": 0, "remaining_tokens": user.get("tokens", 0)}
+
+    if amount <= 0:
+        return {"ok": True, "spent": 0, "remaining_tokens": user.get("tokens", 0)}
+
+    try:
+        new_balance = spend_tokens(user["user_id"], amount)
+        user["tokens"] = new_balance
+        return {"ok": True, "spent": amount, "remaining_tokens": new_balance}
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Token spending failed: {e}")
+        raise HTTPException(500, "Failed to spend tokens")
 
 # ---------- Location ----------
 @api_router.post("/location/update")
