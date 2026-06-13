@@ -25,10 +25,6 @@ try:
 except ImportError:
     redis = None
 
-# ---------- Firebase Admin SDK (for FCM push) ----------
-import firebase_admin
-from firebase_admin import credentials, messaging
-
 ROOT_DIR = Path(__file__).parent
 load_dotenv(ROOT_DIR / '.env')
 
@@ -121,20 +117,12 @@ ETHNICITY_LIST = [
     "South Asian", "Southeast Asian", "Mixed / Other"
 ]
 
-# ---------- Firebase Admin SDK init ----------
-FCM_CRED_PATH = os.environ.get("FCM_CRED_PATH", "firebase-service-account.json")
-if os.path.exists(FCM_CRED_PATH):
-    cred = credentials.Certificate(FCM_CRED_PATH)
-    firebase_admin.initialize_app(cred)
-else:
-    logger.warning("FCM service account not found – push notifications disabled")
-
-# ---------- Helpers ----------
 def contains_profanity(text: str) -> bool:
     if not text: return False
     words = text.lower().split()
     return any(word.strip(".,!?") in PROFANITY_LIST for word in words)
 
+# ---------- Helpers ----------
 def _parse_dt(value):
     if value is None: return None
     if isinstance(value, datetime): dt = value
@@ -158,7 +146,7 @@ def haversine(lat1, lon1, lat2, lon2):
     a = math.sin(dlat/2)**2 + math.cos(math.radians(lat1)) * math.cos(math.radians(lat2)) * math.sin(dlon/2)**2
     return round(EARTH_RADIUS_KM * 2 * math.atan2(math.sqrt(a), math.sqrt(1-a)), 1)
 
-# ---------- Atomic resource spending ----------
+# ---------- Atomic resource spending (loop, no recursion) ----------
 def spend_diamonds(user_id: str, amount: int, item: str, log_purchase: bool = True):
     for attempt in range(3):
         res = sb.table("users").select("diamonds").eq("user_id", user_id).single().execute()
@@ -195,7 +183,9 @@ def spend_tokens(user_id: str, amount: int):
             return new_balance
     raise HTTPException(409, "Balance conflict, please retry")
 
+# ---------- Atomic diamond increment (for PayPal/Google Play) ----------
 def increment_diamonds(user_id: str, amount: int) -> int:
+    """Increase diamonds atomically via Supabase RPC."""
     try:
         result = sb.rpc('increment_diamonds', {'uid': user_id, 'amt': amount}).execute()
         if not result.data:
@@ -205,6 +195,7 @@ def increment_diamonds(user_id: str, amount: int) -> int:
         logger.error(f"increment_diamonds failed: {e}")
         raise HTTPException(500, "Diamond update error")
 
+# ---------- Reverse geocode (async) ----------
 async def reverse_geocode(lat: float, lon: float) -> tuple:
     try:
         client = get_async_client()
@@ -235,6 +226,7 @@ async def get_location_from_ip(ip: str) -> dict:
         logger.error(f"IP geolocation failed: {e}")
     return None
 
+# ---------- Image Helpers ----------
 def compress_image(base64_str: str, max_size_kb: int = 300) -> bytes:
     if len(base64_str) > MAX_IMAGE_BASE64_SIZE:
         raise HTTPException(400, "Image too large (max 5 MB)")
@@ -259,6 +251,7 @@ def upload_image_to_supabase(file_bytes: bytes, user_id: str, filename: str) -> 
     return f"{SUPABASE_URL}/storage/v1/object/public/{STORAGE_BUCKET}/{path}"
 
 def process_image_field(image_value: str, user_id: str, filename_prefix: str) -> str:
+    """Compress, upload, and return URL. Caller must handle cleanup on DB insert failure."""
     if not image_value: return image_value
     if image_value.startswith("data:image") or (len(image_value) > 1000 and "base64" in image_value):
         if len(image_value) > MAX_IMAGE_BASE64_SIZE:
@@ -274,45 +267,17 @@ def process_image_field(image_value: str, user_id: str, filename_prefix: str) ->
             return image_value
     return image_value
 
-# ---------- Notifications + FCM push ----------
+# ---------- Realtime notification helper ----------
 def notify_user(user_id: str, ntype: str, message: str, from_user_id: str = "system"):
     nid = f"notif_{uuid.uuid4().hex[:12]}"
-    sb.table("notifications").insert({
-        "notification_id": nid, "user_id": user_id, "from_user_id": from_user_id,
-        "type": ntype, "message": message, "created_at": datetime.now(timezone.utc).isoformat()
-    }).execute()
+    sb.table("notifications").insert({"notification_id": nid, "user_id": user_id, "from_user_id": from_user_id, "type": ntype, "message": message, "created_at": datetime.now(timezone.utc).isoformat()}).execute()
     try:
         channel = sb.channel(f"user-{user_id}")
         channel.send({"type": "broadcast", "event": "new_notification", "payload": {"type": ntype, "message": message}})
     except Exception as e:
         logger.error(f"Realtime broadcast failed: {e}")
-    try:
-        user_data = sb.table("users").select("fcm_token").eq("user_id", user_id).single().execute().data
-        if user_data and user_data.get("fcm_token"):
-            fcm_token = user_data["fcm_token"]
-            _send_fcm_push(fcm_token, ntype, message)
-    except Exception as e:
-        logger.error(f"FCM push failed: {e}")
 
-def _send_fcm_push(token: str, ntype: str, body: str):
-    if not firebase_admin._apps:
-        return
-    try:
-        msg = messaging.Message(
-            notification=messaging.Notification(
-                title="Haven",
-                body=body,
-            ),
-            data={
-                "type": ntype,
-                "click_action": "FLUTTER_NOTIFICATION_CLICK",
-            },
-            token=token,
-        )
-        messaging.send(msg)
-    except Exception as e:
-        logger.error(f"FCM send error: {e}")
-
+# ---------- Premium helpers ----------
 def is_premium(user: dict) -> bool:
     tier = user.get("premium_tier")
     if not tier: return False
@@ -329,8 +294,10 @@ def require_token(user: dict, cost: int = 1):
 # ---------- Models ----------
 class LocationUpdatePayload(BaseModel):
     latitude: float; longitude: float; accuracy: Optional[float] = None
+
 class GoogleAuthPayload(BaseModel):
     id_token: str; email: str; name: str; picture: str; ref: Optional[str] = None
+
 class ProfileSetupPayload(BaseModel):
     date_of_birth: str; gender: str; health_status: str
     sexual_orientation: Optional[str] = ""
@@ -353,10 +320,14 @@ class ProfileSetupPayload(BaseModel):
     hide_from_health_statuses: Optional[str] = ""
     visible_to: Optional[str] = "all"
     lock_all_images: Optional[bool] = False
+
 class ProfileUpdatePayload(BaseModel):
     date_of_birth: Optional[str] = None; gender: Optional[str] = None; health_status: Optional[str] = None
-    sexual_orientation: Optional[str] = None; positive_since: Optional[str] = None
-    height: Optional[str] = None; ethnicity: Optional[str] = None; religion: Optional[str] = None
+    sexual_orientation: Optional[str] = None
+    positive_since: Optional[str] = None
+    height: Optional[str] = None
+    ethnicity: Optional[str] = None
+    religion: Optional[str] = None
     display_name: Optional[str] = None; bio: Optional[str] = None; interests: Optional[str] = None
     looking_for: Optional[str] = None; education: Optional[str] = None; kids: Optional[str] = None
     want_kids: Optional[str] = None; smoke: Optional[str] = None; drink: Optional[str] = None
@@ -371,6 +342,7 @@ class ProfileUpdatePayload(BaseModel):
     hide_from_health_statuses: Optional[str] = None
     visible_to: Optional[str] = None
     lock_all_images: Optional[bool] = None
+
 class CreateStoryPayload(BaseModel):
     content: str; category: str; title: Optional[str] = ""
 class CreateCommentPayload(BaseModel):
@@ -383,14 +355,21 @@ class ReportPayload(BaseModel):
     reported_user_id: str; reason: Optional[str] = ""
 class BlockPayload(BaseModel):
     blocked_user_id: str
+
 class AdminBanPayload(BaseModel):
-    user_id: str; reason: str = ""; duration_days: Optional[int] = None
+    user_id: str
+    reason: str = ""
+    duration_days: Optional[int] = None
+
 class AdminUnbanPayload(BaseModel):
     user_id: str
+
 class AdminAnnouncePayload(BaseModel):
     message: str
+
 class AdminVerifyUserPayload(BaseModel):
-    user_id: str; verified: bool = True
+    user_id: str
+    verified: bool = True
 
 # ---------- Auth dependency ----------
 def get_current_user(
@@ -405,9 +384,12 @@ def get_current_user(
     session = _maybe(res)
     if not session: raise HTTPException(status_code=401, detail="Invalid session")
     if _parse_dt(session["expires_at"]) < datetime.now(timezone.utc): raise HTTPException(status_code=401)
+    # --- FIX: add is_admin to the select columns ---
     user = _maybe(sb.table("users").select("user_id,email,name,picture,verified,premium_tier,premium_expires_at,auto_renew,tokens,diamonds,privacy_accepted_at,created_at,last_active,deleted,is_admin").eq("user_id", session["user_id"]).maybe_single().execute())
     if not user: raise HTTPException(status_code=401, detail="User not found")
-    if user.get("deleted"): raise HTTPException(status_code=401, detail="Account deleted")
+    if user.get("deleted"):
+        raise HTTPException(status_code=401, detail="Account deleted")
+
     # Auto‑renew / expiry check
     old_tier = user.get("premium_tier")
     if old_tier and not is_premium(user):
@@ -439,11 +421,13 @@ def get_current_user(
             sb.table("users").update({"premium_tier": None, "premium_expires_at": None}).eq("user_id", user["user_id"]).execute()
             user["premium_tier"] = None
             user["premium_expires_at"] = None
+
     # Debounced last_active update
     last_active = user.get("last_active")
     now = datetime.now(timezone.utc)
     if not last_active or (now - _parse_dt(last_active)) >= timedelta(minutes=5):
         sb.table("users").update({"last_active": now.isoformat()}).eq("user_id", user["user_id"]).execute()
+
     return user
 
 # ==================== ROOT ====================
@@ -792,6 +776,9 @@ def earn_tokens_ad(user: dict = Depends(get_current_user)):
     sb.table("users").update({"tokens": new_tokens, "last_ad_token_earned": datetime.now(timezone.utc).isoformat()}).eq("user_id", user["user_id"]).execute()
     return {"ok": True, "tokens_awarded": 2, "total_tokens": new_tokens}
 
+# ---------- Earn tokens ----------
+# ... existing earn_tokens and earn_tokens_ad ...
+
 @api_router.post("/earn-tokens-rewarded")
 def earn_tokens_rewarded(user: dict = Depends(get_current_user)):
     """Rewarded ad – gives 7 tokens, same cooldown as regular ad earning."""
@@ -809,6 +796,7 @@ def earn_tokens_rewarded(user: dict = Depends(get_current_user)):
     }).eq("user_id", user["user_id"]).execute()
     return {"ok": True, "tokens_awarded": 7, "total_tokens": new_tokens}
 
+
 @api_router.post("/spend-tokens")
 def spend_tokens_endpoint(amount: int = 1, user: dict = Depends(get_current_user)):
     """
@@ -817,8 +805,10 @@ def spend_tokens_endpoint(amount: int = 1, user: dict = Depends(get_current_user
     """
     if is_premium(user):
         return {"ok": True, "spent": 0, "remaining_tokens": user.get("tokens", 0)}
+
     if amount <= 0:
         return {"ok": True, "spent": 0, "remaining_tokens": user.get("tokens", 0)}
+
     try:
         new_balance = spend_tokens(user["user_id"], amount)
         user["tokens"] = new_balance
@@ -980,6 +970,7 @@ def setup_profile(payload: ProfileSetupPayload, user: dict = Depends(get_current
                 uploaded_urls.append(url)
             gallery.append(url)
         except Exception:
+            # Cleanup previously uploaded images
             for url in uploaded_urls:
                 try:
                     path = extract_path_from_url(url)
@@ -1031,6 +1022,7 @@ def setup_profile(payload: ProfileSetupPayload, user: dict = Depends(get_current
             profile_data["created_at"] = datetime.now(timezone.utc).isoformat()
             sb.table("user_profiles").insert(profile_data).execute()
     except Exception:
+        # Cleanup images on DB failure
         for url in uploaded_urls:
             try:
                 path = extract_path_from_url(url)
@@ -1167,9 +1159,12 @@ def get_discover_profiles(
         partner = m["user2_id"] if m["user1_id"] == user["user_id"] else m["user1_id"]
         matched_ids.add(partner)
 
+    # Select only needed columns for discovery
     query = sb.table("user_profiles").select(
         "user_id,display_name,date_of_birth,profile_image,gallery_images,gender,country,city,gps_latitude,gps_longitude,health_status,sexual_orientation,religion,ethnicity,height,bio,interests,looking_for,education,kids,want_kids,smoke,drink,employment,profile_hidden,visible_to,lock_all_images,pref_gender,pref_health_status,pref_sexual_orientation,pref_country,pref_max_distance,pref_min_age,pref_max_age,hide_from_min_age,hide_from_max_age,hide_from_health_statuses,onboarding_complete,location_source,gps_verified_at,latitude,longitude,updated_at",
         count="exact"
+        
+        
     ).neq("user_id", user["user_id"]) \
      .eq("onboarding_complete", True) \
      .not_.is_("gps_latitude", None) \
@@ -1311,6 +1306,7 @@ def get_match_messages(match_id: str, user: dict = Depends(get_current_user)):
     if user["user_id"] not in [match["user1_id"], match["user2_id"]]: raise HTTPException(403)
     msgs = sb.table("match_messages").select("*").eq("match_id", match_id).order("created_at").execute().data or []
     other_id = match["user2_id"] if match["user1_id"] == user["user_id"] else match["user1_id"]
+    # Bulk mark all unread from the other user
     sb.table("match_messages").update({"read": True}).eq("match_id", match_id).eq("sender_id", other_id).eq("read", False).execute()
     return msgs
 
@@ -1434,6 +1430,7 @@ def mark_notifications_read(user: dict = Depends(get_current_user)):
 
 @api_router.get("/notifications/unread-count")
 def get_unread_notification_count(user: dict = Depends(get_current_user)):
+    """Lightweight unread count – uses DB index for speed."""
     res = sb.table("notifications") \
         .select("notification_id", count="exact") \
         .eq("user_id", user["user_id"]) \
@@ -1457,7 +1454,7 @@ def get_unread_counts(user: dict = Depends(get_current_user)):
                 dating_count += 1
     return {"dating_unread": dating_count, "friend_unread": friend_count}
 
-# ---------- FCM token registration ----------
+
 @api_router.post("/fcm/register")
 def register_fcm_token(payload: dict, user: dict = Depends(get_current_user)):
     token = payload.get("token")
@@ -1465,6 +1462,7 @@ def register_fcm_token(payload: dict, user: dict = Depends(get_current_user)):
         raise HTTPException(400, "Token required")
     sb.table("users").update({"fcm_token": token}).eq("user_id", user["user_id"]).execute()
     return {"ok": True}
+
 
 # ---------- Report / Block ----------
 @api_router.post("/report")
