@@ -2570,6 +2570,7 @@ def send_public_chat_message(chat_id: str, payload: PublicChatMessagePayload, us
         "chat_id": chat_id,
         "sender_id": user["user_id"],
         "content": payload.content.strip(),
+        "reply_to_id": payload.reply_to_id, 
         "created_at": now
     }).execute()
     
