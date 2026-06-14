@@ -2752,6 +2752,62 @@ def get_whatsapp_contacts(user: dict = Depends(get_current_user)):
     
     return result
 
+# ==================== EMAIL MESSAGING ====================
+
+class EmailPayload(BaseModel):
+    user_id: str
+    subject: str
+    message: str
+
+
+@api_router.post("/email/send")
+def send_email_message(payload: EmailPayload, user: dict = Depends(get_current_user)):
+    """Send an email to a matched user. Free for all verified users."""
+    
+    # Check verification
+    if not user.get("verified"):
+        raise HTTPException(400, "Only verified users can send email messages")
+    
+    # Get target user's email
+    target_user = _maybe(sb.table("users").select("email").eq("user_id", payload.user_id).maybe_single().execute())
+    if not target_user or not target_user.get("email"):
+        raise HTTPException(400, "This user's email is not available")
+    
+    # Verify they are matched (either dating or friends)
+    uid1, uid2 = sorted([user["user_id"], payload.user_id])
+    match = _maybe(sb.table("profile_matches").select("*").eq("user1_id", uid1).eq("user2_id", uid2).maybe_single().execute())
+    if not match:
+        raise HTTPException(403, "You can only send emails to matched users")
+    
+    # Get sender's display name
+    sender_profile = _maybe(sb.table("user_profiles").select("display_name").eq("user_id", user["user_id"]).maybe_single().execute())
+    sender_name = sender_profile.get("display_name", "Someone") if sender_profile else "Someone"
+    
+    # Send the email
+    try:
+        email_body = f"""
+        <h2>💜 Haven Dating</h2>
+        <p><strong>{sender_name}</strong> sent you a message:</p>
+        <blockquote style="background:#f5f3ee;padding:12px;border-radius:8px;">
+            {payload.message}
+        </blockquote>
+        <p>💬 <a href="https://havenpositive.online/matches">Chat on Haven</a></p>
+        """
+        send_email(target_user["email"], payload.subject or f"Message from {sender_name}", email_body)
+    except Exception as e:
+        logger.error(f"Email send failed: {e}")
+        raise HTTPException(500, "Failed to send email")
+    
+    # Notify the recipient
+    notify_user(
+        payload.user_id,
+        "email_message",
+        f"{sender_name} sent you an email",
+        user["user_id"]
+    )
+    
+    return {"ok": True, "message": "Email sent!"}
+
 
 # ==================== MOUNT ROUTER ====================
 app.include_router(api_router)
