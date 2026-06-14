@@ -1804,7 +1804,7 @@ def join_group(group_id: str, user: dict = Depends(get_current_user)):
     existing = _maybe(sb.table("group_members").select("role").eq("group_id", group_id).eq("user_id", user["user_id"]).maybe_single().execute())
     if existing: raise HTTPException(400, "Already a member")
     ban = _maybe(sb.table("group_bans").select("banned_until").eq("group_id", group_id).eq("user_id", user["user_id"]).maybe_single().execute())
-    if ban and (ban.get("banned_until") is None or _parse_dt(ban["banned_until"]) > datetime.now(timezone.utc):
+    if ban and (ban.get("banned_until") is None or _parse_dt(ban["banned_until"]) > datetime.now(timezone.utc)):
         raise HTTPException(403, "You are banned")
     join_cost = group.get("join_cost", 0)
     if join_cost > 0:
