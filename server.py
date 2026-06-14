@@ -2456,6 +2456,155 @@ def get_user_profile(user_id: str):
     if not profile: raise HTTPException(404, "User not found")
     return profile
 
+# ==================== PUBLIC CHATS ====================
+
+# Create the three default public chats if they don't exist (run once)
+def ensure_public_chats():
+    """Create HIV, HSV, HPV public chats if they don't exist."""
+    for chat_type in ["HIV", "HSV", "HPV"]:
+        existing = _maybe(sb.table("public_chats").select("chat_id").eq("chat_type", chat_type).maybe_single().execute())
+        if not existing:
+            chat_id = f"pub_{chat_type.lower()}_{uuid.uuid4().hex[:8]}"
+            sb.table("public_chats").insert({
+                "chat_id": chat_id,
+                "chat_type": chat_type,
+                "title": f"{chat_type} Community Chat",
+                "created_at": datetime.now(timezone.utc).isoformat()
+            }).execute()
+
+# Call on startup
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    get_async_client()
+    _cache_countries()
+    ensure_public_chats()   # ← create default chats
+    yield
+    if _async_client:
+        await _async_client.aclose()
+    http_client_sync.close()
+
+
+class PublicChatMessagePayload(BaseModel):
+    content: str
+    chat_type: str   # "HIV", "HSV", or "HPV"
+
+
+@api_router.get("/public-chats")
+def get_public_chats(user: dict = Depends(get_current_user)):
+    """Get list of available public chats."""
+    chats = sb.table("public_chats").select("*").execute().data or []
+    result = []
+    for chat in chats:
+        # Get last message for preview
+        last_msg = sb.table("public_chat_messages").select("*").eq("chat_id", chat["chat_id"]).order("created_at", desc=True).limit(1).execute().data
+        last_message = last_msg[0] if last_msg else None
+        # Get online count (active in last 5 minutes)
+        five_min_ago = (datetime.now(timezone.utc) - timedelta(minutes=5)).isoformat()
+        # Count unique senders in last 5 minutes
+        active_count = len(set(
+            m["sender_id"] for m in (sb.table("public_chat_messages")
+                .select("sender_id")
+                .eq("chat_id", chat["chat_id"])
+                .gte("created_at", five_min_ago)
+                .execute().data or [])
+        ))
+        result.append({
+            "chat_id": chat["chat_id"],
+            "chat_type": chat["chat_type"],
+            "title": chat["title"],
+            "last_message": last_message["content"][:100] if last_message else None,
+            "last_message_time": last_message["created_at"] if last_message else None,
+            "active_users": active_count,
+            "total_messages": len(sb.table("public_chat_messages").select("message_id", count="exact").eq("chat_id", chat["chat_id"]).execute().data or []),
+        })
+    return result
+
+
+@api_router.get("/public-chats/{chat_id}/messages")
+def get_public_chat_messages(chat_id: str, limit: int = 50, user: dict = Depends(get_current_user)):
+    """Get messages for a public chat."""
+    chat = _maybe(sb.table("public_chats").select("*").eq("chat_id", chat_id).maybe_single().execute())
+    if not chat:
+        raise HTTPException(404, "Chat not found")
+    
+    msgs = sb.table("public_chat_messages").select("*").eq("chat_id", chat_id).order("created_at", desc=True).limit(limit).execute().data or []
+    msgs.reverse()
+    
+    # Get sender profiles
+    sender_ids = list({m["sender_id"] for m in msgs})
+    profiles = {}
+    if sender_ids:
+        prof_data = sb.table("user_profiles").select("user_id,display_name,profile_image").in_("user_id", sender_ids).execute().data or []
+        profiles = {p["user_id"]: p for p in prof_data}
+    
+    result = []
+    for msg in msgs:
+        prof = profiles.get(msg["sender_id"], {})
+        result.append({
+            "message_id": msg["message_id"],
+            "chat_id": msg["chat_id"],
+            "sender_id": msg["sender_id"],
+            "sender_name": prof.get("display_name", "Anonymous"),
+            "sender_avatar": prof.get("profile_image", ""),
+            "content": msg["content"],
+            "created_at": msg["created_at"],
+        })
+    return result
+
+
+@api_router.post("/public-chats/{chat_id}/messages")
+def send_public_chat_message(chat_id: str, payload: PublicChatMessagePayload, user: dict = Depends(get_current_user)):
+    """Send a message to a public chat."""
+    if contains_profanity(payload.content):
+        raise HTTPException(400, "Message contains inappropriate language")
+    
+    chat = _maybe(sb.table("public_chats").select("*").eq("chat_id", chat_id).maybe_single().execute())
+    if not chat:
+        raise HTTPException(404, "Chat not found")
+    
+    message_id = f"pubmsg_{uuid.uuid4().hex[:12]}"
+    now = datetime.now(timezone.utc).isoformat()
+    
+    sb.table("public_chat_messages").insert({
+        "message_id": message_id,
+        "chat_id": chat_id,
+        "sender_id": user["user_id"],
+        "content": payload.content.strip(),
+        "created_at": now
+    }).execute()
+    
+    # Get sender profile for response
+    profile = _maybe(sb.table("user_profiles").select("display_name,profile_image").eq("user_id", user["user_id"]).maybe_single().execute())
+    
+    return {
+        "ok": True,
+        "message": {
+            "message_id": message_id,
+            "chat_id": chat_id,
+            "sender_id": user["user_id"],
+            "sender_name": profile.get("display_name", user.get("name", "Anonymous")) if profile else user.get("name", "Anonymous"),
+            "sender_avatar": profile.get("profile_image", "") if profile else "",
+            "content": payload.content.strip(),
+            "created_at": now,
+        }
+    }
+
+
+@api_router.delete("/public-chats/messages/{message_id}")
+def delete_public_chat_message(message_id: str, user: dict = Depends(get_current_user)):
+    """Delete own message from public chat."""
+    msg = _maybe(sb.table("public_chat_messages").select("*").eq("message_id", message_id).maybe_single().execute())
+    if not msg:
+        raise HTTPException(404, "Message not found")
+    if msg["sender_id"] != user["user_id"] and not user.get("is_admin"):
+        raise HTTPException(403, "Cannot delete this message")
+    
+    sb.table("public_chat_messages").delete().eq("message_id", message_id).execute()
+    return {"ok": True}
+
+
+
+
 # ==================== MOUNT ROUTER ====================
 app.include_router(api_router)
 
