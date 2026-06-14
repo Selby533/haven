@@ -328,6 +328,7 @@ class ProfileSetupPayload(BaseModel):
     hide_from_health_statuses: Optional[str] = ""
     visible_to: Optional[str] = "all"
     lock_all_images: Optional[bool] = False
+    phone_number: Optional[str]
 
     @validator('date_of_birth')
     def validate_age(cls, v):
@@ -360,10 +361,12 @@ class ProfileUpdatePayload(BaseModel):
     pref_max_distance: Optional[int] = None; pref_health_status: Optional[str] = None
     pref_sexual_orientation: Optional[str] = None
     profile_hidden: Optional[bool] = None
+    phone_number: Optional[str] = None   # ← ADD THIS LINE
     hide_from_min_age: Optional[int] = None; hide_from_max_age: Optional[int] = None
     hide_from_health_statuses: Optional[str] = None
     visible_to: Optional[str] = None
     lock_all_images: Optional[bool] = None
+    
 
 class CreateStoryPayload(BaseModel):
     content: str; category: str; title: Optional[str] = ""
@@ -982,6 +985,7 @@ def setup_profile(payload: ProfileSetupPayload, user: dict = Depends(get_current
         "pref_max_distance": payload.pref_max_distance or 15000,
         "pref_health_status": payload.pref_health_status or "",
         "pref_sexual_orientation": payload.pref_sexual_orientation or "",
+        "phone_number": payload.phone_number or "",   # ← ADD THIS LINE
         "profile_hidden": payload.profile_hidden if user.get("verified") else False,
         "hide_from_min_age": payload.hide_from_min_age if user.get("verified") else None,
         "hide_from_max_age": payload.hide_from_max_age if user.get("verified") else None,
@@ -1061,7 +1065,8 @@ def update_profile(payload: ProfileUpdatePayload, user: dict = Depends(get_curre
         "pref_gender", "pref_min_age", "pref_max_age", "pref_country",
         "pref_max_distance", "pref_health_status", "pref_sexual_orientation",
         "hide_from_min_age", "hide_from_max_age", "hide_from_health_statuses",
-        "visible_to", "lock_all_images"
+        "visible_to", "lock_all_images",
+        "phone_number",   # ← ADD THIS LINE
     ]
     for field in all_fields:
         value = getattr(payload, field, None)
@@ -2742,3 +2747,5 @@ app.include_router(api_router)
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=int(os.environ.get("PORT", 8000)))
+    
+    
