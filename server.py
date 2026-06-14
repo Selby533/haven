@@ -384,7 +384,6 @@ def get_current_user(
     session = _maybe(res)
     if not session: raise HTTPException(status_code=401, detail="Invalid session")
     if _parse_dt(session["expires_at"]) < datetime.now(timezone.utc): raise HTTPException(status_code=401)
-    # --- FIX: add is_admin to the select columns ---
     user = _maybe(sb.table("users").select("user_id,email,name,picture,verified,premium_tier,premium_expires_at,auto_renew,tokens,diamonds,privacy_accepted_at,created_at,last_active,deleted,is_admin").eq("user_id", session["user_id"]).maybe_single().execute())
     if not user: raise HTTPException(status_code=401, detail="User not found")
     if user.get("deleted"):
@@ -630,7 +629,6 @@ async def create_diamond_order(package_id: str, request: Request, user: dict = D
 
 @api_router.post("/diamonds/capture-order")
 async def capture_diamond_order(order_id: str, package_id: str, user: dict = Depends(get_current_user)):
-    # Idempotency check
     already = sb.table("diamond_purchases").select("purchase_id").eq("paypal_order_id", order_id).maybe_single().execute()
     if already.data:
         raise HTTPException(409, "Order already processed")
@@ -671,7 +669,6 @@ async def capture_diamond_order(order_id: str, package_id: str, user: dict = Dep
     if not diamonds:
         raise HTTPException(400, "Invalid package")
 
-    # Insert purchase record FIRST (idempotency guard)
     purchase_record = {
         "purchase_id": f"diam_{uuid.uuid4().hex[:12]}",
         "user_id": user["user_id"],
@@ -682,7 +679,6 @@ async def capture_diamond_order(order_id: str, package_id: str, user: dict = Dep
     }
     sb.table("diamond_purchases").insert(purchase_record).execute()
 
-    # Atomic increment using RPC
     new_diamonds = increment_diamonds(user["user_id"], diamonds)
     return {"ok": True, "diamonds": new_diamonds}
 
@@ -694,7 +690,6 @@ def verify_google_purchase(payload: dict, user: dict = Depends(get_current_user)
     if not product_id or not purchase_token:
         raise HTTPException(400, "Missing product_id or purchase_token")
 
-    # Idempotency check
     already = sb.table("diamond_purchases").select("purchase_id").eq("google_purchase_token", purchase_token).maybe_single().execute()
     if already.data:
         raise HTTPException(409, "Purchase already processed")
@@ -731,7 +726,6 @@ def verify_google_purchase(payload: dict, user: dict = Depends(get_current_user)
                 body={}
             ).execute()
 
-            # Insert purchase record FIRST (idempotency guard)
             sb.table("diamond_purchases").insert({
                 "purchase_id": f"diam_{uuid.uuid4().hex[:12]}",
                 "user_id": user["user_id"],
@@ -776,9 +770,6 @@ def earn_tokens_ad(user: dict = Depends(get_current_user)):
     sb.table("users").update({"tokens": new_tokens, "last_ad_token_earned": datetime.now(timezone.utc).isoformat()}).eq("user_id", user["user_id"]).execute()
     return {"ok": True, "tokens_awarded": 2, "total_tokens": new_tokens}
 
-# ---------- Earn tokens ----------
-# ... existing earn_tokens and earn_tokens_ad ...
-
 @api_router.post("/earn-tokens-rewarded")
 def earn_tokens_rewarded(user: dict = Depends(get_current_user)):
     """Rewarded ad – gives 7 tokens, same cooldown as regular ad earning."""
@@ -796,19 +787,12 @@ def earn_tokens_rewarded(user: dict = Depends(get_current_user)):
     }).eq("user_id", user["user_id"]).execute()
     return {"ok": True, "tokens_awarded": 7, "total_tokens": new_tokens}
 
-
 @api_router.post("/spend-tokens")
 def spend_tokens_endpoint(amount: int = 1, user: dict = Depends(get_current_user)):
-    """
-    Spend multiple tokens at once – called when user has viewed several profiles.
-    Premium users are not charged.
-    """
     if is_premium(user):
         return {"ok": True, "spent": 0, "remaining_tokens": user.get("tokens", 0)}
-
     if amount <= 0:
         return {"ok": True, "spent": 0, "remaining_tokens": user.get("tokens", 0)}
-
     try:
         new_balance = spend_tokens(user["user_id"], amount)
         user["tokens"] = new_balance
@@ -954,7 +938,6 @@ def setup_profile(payload: ProfileSetupPayload, user: dict = Depends(get_current
     country = existing_profile.get("country") if existing_profile and lat else None
     city = existing_profile.get("city") if existing_profile and lat else None
 
-    # Upload images and collect URLs
     uploaded_urls = []
     try:
         profile_image = process_image_field(payload.profile_image, user["user_id"], "profile")
@@ -970,7 +953,6 @@ def setup_profile(payload: ProfileSetupPayload, user: dict = Depends(get_current
                 uploaded_urls.append(url)
             gallery.append(url)
         except Exception:
-            # Cleanup previously uploaded images
             for url in uploaded_urls:
                 try:
                     path = extract_path_from_url(url)
@@ -1022,7 +1004,6 @@ def setup_profile(payload: ProfileSetupPayload, user: dict = Depends(get_current
             profile_data["created_at"] = datetime.now(timezone.utc).isoformat()
             sb.table("user_profiles").insert(profile_data).execute()
     except Exception:
-        # Cleanup images on DB failure
         for url in uploaded_urls:
             try:
                 path = extract_path_from_url(url)
@@ -1121,7 +1102,7 @@ def update_profile(payload: ProfileUpdatePayload, user: dict = Depends(get_curre
 def get_my_profile(user: dict = Depends(get_current_user)):
     return get_profile(user)
 
-# ---------- Discovery ----------
+# ---------- Discovery (TOKEN DEDUCTION REMOVED) ----------
 @api_router.get("/discover/profiles")
 def get_discover_profiles(
     user: dict = Depends(get_current_user),
@@ -1159,12 +1140,9 @@ def get_discover_profiles(
         partner = m["user2_id"] if m["user1_id"] == user["user_id"] else m["user1_id"]
         matched_ids.add(partner)
 
-    # Select only needed columns for discovery
     query = sb.table("user_profiles").select(
         "user_id,display_name,date_of_birth,profile_image,gallery_images,gender,country,city,gps_latitude,gps_longitude,health_status,sexual_orientation,religion,ethnicity,height,bio,interests,looking_for,education,kids,want_kids,smoke,drink,employment,profile_hidden,visible_to,lock_all_images,pref_gender,pref_health_status,pref_sexual_orientation,pref_country,pref_max_distance,pref_min_age,pref_max_age,hide_from_min_age,hide_from_max_age,hide_from_health_statuses,onboarding_complete,location_source,gps_verified_at,latitude,longitude,updated_at",
         count="exact"
-        
-        
     ).neq("user_id", user["user_id"]) \
      .eq("onboarding_complete", True) \
      .not_.is_("gps_latitude", None) \
@@ -1218,15 +1196,12 @@ def get_discover_profiles(
         p["last_active"] = status.get("last_active")
         filtered.append(p)
 
-    if not is_premium(user):
-        require_token(user, len(filtered))
-
+    # Token deduction REMOVED – browsing is free (ad-supported)
     return filtered
 
 @api_router.post("/discover/swipe")
 def swipe_profile(payload: SwipePayload, user: dict = Depends(get_current_user)):
-    if not is_premium(user):
-        require_token(user, 1)
+    # Token deduction REMOVED – swiping is free (ad-supported)
     if payload.direction not in ["like","pass"]: raise HTTPException(400)
     target = _maybe(sb.table("user_profiles").select("user_id").eq("user_id", payload.swiped_id).maybe_single().execute())
     if not target: raise HTTPException(404)
@@ -1306,7 +1281,6 @@ def get_match_messages(match_id: str, user: dict = Depends(get_current_user)):
     if user["user_id"] not in [match["user1_id"], match["user2_id"]]: raise HTTPException(403)
     msgs = sb.table("match_messages").select("*").eq("match_id", match_id).order("created_at").execute().data or []
     other_id = match["user2_id"] if match["user1_id"] == user["user_id"] else match["user1_id"]
-    # Bulk mark all unread from the other user
     sb.table("match_messages").update({"read": True}).eq("match_id", match_id).eq("sender_id", other_id).eq("read", False).execute()
     return msgs
 
@@ -1314,11 +1288,6 @@ def get_match_messages(match_id: str, user: dict = Depends(get_current_user)):
 def send_match_message(match_id: str, payload: MatchMessagePayload, user: dict = Depends(get_current_user)):
     if contains_profanity(payload.content):
         raise HTTPException(400, "Message contains inappropriate language")
-    if not is_premium(user):
-        count_res = sb.table("match_messages").select("message_id", count="exact").eq("match_id", match_id).eq("sender_id", user["user_id"]).execute()
-        msg_count = count_res.count if hasattr(count_res, 'count') else 0
-        if msg_count >= 2:
-            require_token(user, 1)
     match = _maybe(sb.table("profile_matches").select("*").eq("match_id", match_id).maybe_single().execute())
     if not match: raise HTTPException(404)
     if user["user_id"] not in [match["user1_id"], match["user2_id"]]: raise HTTPException(403)
@@ -1430,7 +1399,6 @@ def mark_notifications_read(user: dict = Depends(get_current_user)):
 
 @api_router.get("/notifications/unread-count")
 def get_unread_notification_count(user: dict = Depends(get_current_user)):
-    """Lightweight unread count – uses DB index for speed."""
     res = sb.table("notifications") \
         .select("notification_id", count="exact") \
         .eq("user_id", user["user_id"]) \
@@ -1454,7 +1422,6 @@ def get_unread_counts(user: dict = Depends(get_current_user)):
                 dating_count += 1
     return {"dating_unread": dating_count, "friend_unread": friend_count}
 
-
 @api_router.post("/fcm/register")
 def register_fcm_token(payload: dict, user: dict = Depends(get_current_user)):
     token = payload.get("token")
@@ -1462,7 +1429,6 @@ def register_fcm_token(payload: dict, user: dict = Depends(get_current_user)):
         raise HTTPException(400, "Token required")
     sb.table("users").update({"fcm_token": token}).eq("user_id", user["user_id"]).execute()
     return {"ok": True}
-
 
 # ---------- Report / Block ----------
 @api_router.post("/report")
@@ -1610,10 +1576,10 @@ def build_comment_tree(comments):
         else: roots.append(node)
     return roots
 
-# ---------- Random Chat token charge ----------
+# ---------- Random Chat (TOKEN DEDUCTION REMOVED) ----------
 @api_router.post("/chat/start")
 def chat_start(user: dict = Depends(get_current_user)):
-    require_token(user, 1)
+    # Token deduction REMOVED – chat is free (ad-supported)
     return {"ok": True}
 
 # ---------- Flexer Board ----------
