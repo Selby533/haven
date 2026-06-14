@@ -5,7 +5,7 @@ from starlette.middleware.cors import CORSMiddleware
 from supabase import create_client, Client
 import os, logging, uuid, random, math, httpx, io, base64, time, secrets, json
 from pathlib import Path
-from pydantic import BaseModel
+from pydantic import BaseModel, validator
 from typing import Optional, List, Dict
 from datetime import datetime, timezone, timedelta
 from PIL import Image
@@ -320,6 +320,20 @@ class ProfileSetupPayload(BaseModel):
     hide_from_health_statuses: Optional[str] = ""
     visible_to: Optional[str] = "all"
     lock_all_images: Optional[bool] = False
+
+    @validator('date_of_birth')
+    def validate_age(cls, v):
+        try:
+            dob = datetime.strptime(v, "%Y-%m-%d").date()
+            today = datetime.now(timezone.utc).date()
+            age = today.year - dob.year - ((today.month, today.day) < (dob.month, dob.day))
+            if age < 18:
+                raise ValueError("You must be at least 18 years old")
+            if age > 100:
+                raise ValueError("Age must be 100 or less")
+            return v
+        except ValueError as e:
+            raise ValueError(str(e))
 
 class ProfileUpdatePayload(BaseModel):
     date_of_birth: Optional[str] = None; gender: Optional[str] = None; health_status: Optional[str] = None
@@ -904,7 +918,7 @@ def get_profile(user: dict) -> dict:
         "onboarding_complete": profile.get("onboarding_complete", False),
         "pref_gender": profile.get("pref_gender",""), "pref_min_age": profile.get("pref_min_age",18),
         "pref_max_age": profile.get("pref_max_age",99), "pref_country": profile.get("pref_country",""),
-        "pref_max_distance": profile.get("pref_max_distance",5000),
+        "pref_max_distance": profile.get("pref_max_distance", 15000),
         "pref_health_status": profile.get("pref_health_status",""),
         "pref_sexual_orientation": profile.get("pref_sexual_orientation",""),
         "profile_hidden": profile.get("profile_hidden", False),
@@ -980,7 +994,7 @@ def setup_profile(payload: ProfileSetupPayload, user: dict = Depends(get_current
         "profile_image": profile_image, "gallery_images": gallery,
         "pref_gender": payload.pref_gender or "", "pref_min_age": payload.pref_min_age,
         "pref_max_age": payload.pref_max_age, "pref_country": payload.pref_country or "",
-        "pref_max_distance": payload.pref_max_distance,
+        "pref_max_distance": payload.pref_max_distance or 15000,
         "pref_health_status": payload.pref_health_status or "",
         "pref_sexual_orientation": payload.pref_sexual_orientation or "",
         "profile_hidden": payload.profile_hidden if user.get("verified") else False,
@@ -1073,6 +1087,17 @@ def update_profile(payload: ProfileUpdatePayload, user: dict = Depends(get_curre
                 raise HTTPException(400, "Only verified users can restrict visibility to verified members")
             if field == "lock_all_images" and value and not user.get("verified"):
                 raise HTTPException(400, "Only verified users can lock all images")
+            if field == "date_of_birth" and value is not None:
+                try:
+                    dob = datetime.strptime(value, "%Y-%m-%d").date()
+                    today = datetime.now(timezone.utc).date()
+                    age = today.year - dob.year - ((today.month, today.day) < (dob.month, dob.day))
+                    if age < 18:
+                        raise HTTPException(400, "You must be at least 18 years old")
+                    if age > 100:
+                        raise HTTPException(400, "Age must be 100 or less")
+                except ValueError:
+                    raise HTTPException(400, "Invalid date format")
             updates[field] = value
     if payload.profile_hidden is not None:
         updates["profile_hidden"] = payload.profile_hidden if is_premium(user) else False
@@ -2437,4 +2462,3 @@ app.include_router(api_router)
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=int(os.environ.get("PORT", 8000)))
-    
