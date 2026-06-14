@@ -2069,7 +2069,7 @@ def delete_group_comment(group_id: str, message_id: str, comment_id: str, user: 
 # ==================== EMAIL / PASSWORD AUTH ====================
 def send_email(to_email: str, subject: str, body: str):
     brevo_api_key = os.environ.get("BREVO_API_KEY")
-    smtp_from = os.environ.get("SMTP_FROM", "noreply@havenpositive.online")
+    smtp_from = os.environ.get("SMTP_FROM", "pastperfect@havenpositive.online")
     if not brevo_api_key:
         logger.info(f"Brevo API key not configured – email not sent.")
         return
