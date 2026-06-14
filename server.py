@@ -2642,19 +2642,28 @@ TWILIO_WHATSAPP_NUMBER = os.environ.get("TWILIO_WHATSAPP_NUMBER", "whatsapp:+141
 
 
 def send_whatsapp_message(to_phone: str, sender_name: str, message: str):
+    """Send a WhatsApp message via Twilio."""
     if not TWILIO_ACCOUNT_SID or not TWILIO_AUTH_TOKEN:
         raise HTTPException(500, "WhatsApp service not configured")
     
     client = TwilioClient(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
     
-    # ENSURE the "whatsapp:" prefix is present
-    if not to_phone.startswith("whatsapp:"):
-        to_phone = f"whatsapp:{to_phone}"
+    # Remove any existing whatsapp: prefix, then add it fresh
+    if to_phone.startswith("whatsapp:"):
+        to_phone = to_phone[9:]  # Remove "whatsapp:"
+    
+    # Clean the number (remove spaces, etc.)
+    to_phone = to_phone.strip().replace(" ", "")
+    
+    # Add the whatsapp: prefix
+    to_whatsapp = f"whatsapp:{to_phone}"
+    
+    logger.info(f"Sending WhatsApp from {TWILIO_WHATSAPP_NUMBER} to {to_whatsapp}")
     
     msg = client.messages.create(
         body=f"💜 Haven\n{sender_name} sent you a message:\n\n{message}\n\n💬 Chat: https://havenpositive.online/matches",
         from_=TWILIO_WHATSAPP_NUMBER,
-        to=to_phone
+        to=to_whatsapp
     )
     return msg.sid
 
