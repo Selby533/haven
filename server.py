@@ -2621,6 +2621,121 @@ def delete_public_chat_message(message_id: str, user: dict = Depends(get_current
     sb.table("public_chat_messages").delete().eq("message_id", message_id).execute()
     return {"ok": True}
 
+
+# ==================== WHATSAPP (TWILIO) ====================
+
+# ==================== WHATSAPP (TWILIO) ====================
+
+import os
+from twilio.rest import Client as TwilioClient
+
+TWILIO_ACCOUNT_SID = os.environ.get("TWILIO_ACCOUNT_SID")
+TWILIO_AUTH_TOKEN = os.environ.get("TWILIO_AUTH_TOKEN")
+TWILIO_WHATSAPP_NUMBER = os.environ.get("TWILIO_WHATSAPP_NUMBER", "whatsapp:+14155238886")
+
+
+def send_whatsapp_message(to_phone: str, sender_name: str, message: str):
+    if not TWILIO_ACCOUNT_SID or not TWILIO_AUTH_TOKEN:
+        raise HTTPException(500, "WhatsApp service not configured")
+    
+    client = TwilioClient(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
+    
+    if not to_phone.startswith("whatsapp:"):
+        to_phone = f"whatsapp:{to_phone}"
+    
+    msg = client.messages.create(
+        body=f"💜 Haven\n{sender_name} sent you a message:\n\n{message}\n\n💬 Chat: https://havenpositive.online/matches",
+        from_=TWILIO_WHATSAPP_NUMBER,
+        to=to_phone
+    )
+    return msg.sid
+
+
+class WhatsAppPayload(BaseModel):
+    user_id: str
+    message: str
+
+
+@api_router.post("/whatsapp/send")
+def send_whatsapp(payload: WhatsAppPayload, user: dict = Depends(get_current_user)):
+    if not user.get("verified"):
+        raise HTTPException(400, "Only verified users can send WhatsApp messages")
+    
+    if user.get("diamonds", 0) < 3:
+        raise HTTPException(402, "You need 3 diamonds to send a WhatsApp message")
+    
+    target_profile = _maybe(sb.table("user_profiles").select("phone_number,display_name").eq("user_id", payload.user_id).maybe_single().execute())
+    if not target_profile or not target_profile.get("phone_number"):
+        raise HTTPException(400, "This user hasn't added their phone number yet")
+    
+    uid1, uid2 = sorted([user["user_id"], payload.user_id])
+    match = _maybe(sb.table("profile_matches").select("*").eq("user1_id", uid1).eq("user2_id", uid2).maybe_single().execute())
+    if not match:
+        raise HTTPException(403, "You can only send WhatsApp messages to matched users")
+    
+    spend_diamonds(user["user_id"], 3, "whatsapp_message", log_purchase=True)
+    
+    sender_profile = _maybe(sb.table("user_profiles").select("display_name").eq("user_id", user["user_id"]).maybe_single().execute())
+    sender_name = sender_profile.get("display_name", "Someone") if sender_profile else "Someone"
+    
+    try:
+        send_whatsapp_message(target_profile["phone_number"], sender_name, payload.message.strip())
+    except Exception as e:
+        logger.error(f"WhatsApp send failed: {e}")
+        raise HTTPException(500, "Failed to send WhatsApp message")
+    
+    notify_user(payload.user_id, "whatsapp_message", f"{sender_name} sent you a WhatsApp message", user["user_id"])
+    
+    return {"ok": True, "message": "WhatsApp message sent!"}
+
+
+@api_router.get("/whatsapp/contacts")
+def get_whatsapp_contacts(user: dict = Depends(get_current_user)):
+    sent_dating = sb.table("dating_requests").select("*").eq("from_user_id", user["user_id"]).eq("status", "pending").execute().data or []
+    sent_friend = sb.table("friend_requests").select("*").eq("from_user_id", user["user_id"]).eq("status", "pending").execute().data or []
+    
+    pending_requests = []
+    for req in sent_dating:
+        pending_requests.append({"request_id": req["request_id"], "type": "dating", "user_id": req["to_user_id"], "status": "pending", "created_at": req["created_at"]})
+    for req in sent_friend:
+        pending_requests.append({"request_id": req["request_id"], "type": "friend", "user_id": req["to_user_id"], "status": "pending", "created_at": req["created_at"]})
+    
+    dating_matches = sb.table("profile_matches").select("*").or_(f"user1_id.eq.{user['user_id']},user2_id.eq.{user['user_id']}").eq("swipe_type", "dating").execute().data or []
+    friend_matches = sb.table("profile_matches").select("*").or_(f"user1_id.eq.{user['user_id']},user2_id.eq.{user['user_id']}").eq("swipe_type", "friendship").execute().data or []
+    
+    all_user_ids = set()
+    for req in pending_requests: all_user_ids.add(req["user_id"])
+    for m in dating_matches:
+        pid = m["user2_id"] if m["user1_id"] == user["user_id"] else m["user1_id"]
+        all_user_ids.add(pid)
+    for m in friend_matches:
+        pid = m["user2_id"] if m["user1_id"] == user["user_id"] else m["user1_id"]
+        all_user_ids.add(pid)
+    
+    profiles = {}
+    if all_user_ids:
+        prof_data = sb.table("user_profiles").select("user_id,display_name,profile_image,phone_number,country,city").in_("user_id", list(all_user_ids)).execute().data or []
+        profiles = {p["user_id"]: p for p in prof_data}
+    
+    result = {"pending_requests": [], "dating_matches": [], "friend_matches": []}
+    
+    for req in pending_requests:
+        prof = profiles.get(req["user_id"], {})
+        result["pending_requests"].append({"request_id": req["request_id"], "type": req["type"], "user_id": req["user_id"], "display_name": prof.get("display_name", "Unknown"), "profile_image": prof.get("profile_image", ""), "phone_number": prof.get("phone_number", ""), "country": prof.get("country", ""), "city": prof.get("city", ""), "created_at": req["created_at"]})
+    
+    for m in dating_matches:
+        pid = m["user2_id"] if m["user1_id"] == user["user_id"] else m["user1_id"]
+        prof = profiles.get(pid, {})
+        result["dating_matches"].append({"match_id": m["match_id"], "user_id": pid, "display_name": prof.get("display_name", "Unknown"), "profile_image": prof.get("profile_image", ""), "phone_number": prof.get("phone_number", ""), "country": prof.get("country", ""), "city": prof.get("city", ""), "created_at": m["created_at"]})
+    
+    for m in friend_matches:
+        pid = m["user2_id"] if m["user1_id"] == user["user_id"] else m["user1_id"]
+        prof = profiles.get(pid, {})
+        result["friend_matches"].append({"match_id": m["match_id"], "user_id": pid, "display_name": prof.get("display_name", "Unknown"), "profile_image": prof.get("profile_image", ""), "phone_number": prof.get("phone_number", ""), "country": prof.get("country", ""), "city": prof.get("city", ""), "created_at": m["created_at"]})
+    
+    return result
+
+
 # ==================== MOUNT ROUTER ====================
 app.include_router(api_router)
 

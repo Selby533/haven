@@ -13,3 +13,4 @@ google-auth-httplib2
 google-auth-oauthlib
 pillow-heif>=0.13.0
 firebase-admin>=6.2.0
+twilio>=9.0.0
