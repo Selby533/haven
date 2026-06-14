@@ -2647,6 +2647,7 @@ def send_whatsapp_message(to_phone: str, sender_name: str, message: str):
     
     client = TwilioClient(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
     
+    # ENSURE the "whatsapp:" prefix is present
     if not to_phone.startswith("whatsapp:"):
         to_phone = f"whatsapp:{to_phone}"
     
@@ -2749,3 +2750,5 @@ app.include_router(api_router)
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=int(os.environ.get("PORT", 8000)))
+
+
