@@ -2067,9 +2067,8 @@ def delete_group_comment(group_id: str, message_id: str, comment_id: str, user: 
     sb.table("group_message_comments").delete().eq("comment_id", comment_id).execute()
     return {"ok": True}
 # ==================== EMAIL / PASSWORD AUTH ====================
-def send_email(to_email: str, subject: str, body: str):
+def send_email(to_email: str, subject: str, html_body: str, text_body: str = ""):
     brevo_api_key = os.environ.get("BREVO_API_KEY")
-    smtp_from = os.environ.get("SMTP_FROM", "Haven Dating <pastperfect@havenpositive.online>")
     if not brevo_api_key:
         logger.info(f"Brevo API key not configured – email not sent.")
         return
@@ -2077,7 +2076,8 @@ def send_email(to_email: str, subject: str, body: str):
         "sender": {"name": "Haven Dating", "email": "pastperfect@havenpositive.online"},
         "to": [{"email": to_email}],
         "subject": subject,
-        "htmlContent": body,
+        "htmlContent": html_body,
+        "textContent": text_body,   # ← ADD PLAIN TEXT
     }
     try:
         resp = httpx.post(
@@ -2759,9 +2759,6 @@ class EmailPayload(BaseModel):
     subject: str
     message: str
 @api_router.post("/email/send")
-
-
-
 def send_email_message(payload: EmailPayload, user: dict = Depends(get_current_user)):
     """Send an email to a matched user. Free for all verified users."""
     
@@ -2780,28 +2777,60 @@ def send_email_message(payload: EmailPayload, user: dict = Depends(get_current_u
     sender_profile = _maybe(sb.table("user_profiles").select("display_name").eq("user_id", user["user_id"]).maybe_single().execute())
     sender_name = sender_profile.get("display_name", "Someone") if sender_profile else "Someone"
     
-    subject = payload.subject or f"You have a message from {sender_name}"
+    subject = payload.subject or f"You have a message from {sender_name} on Haven"
     
     try:
+        # Plain text version
+        plain_text = f"""
+Hi,
+
+{sender_name} sent you a message on Haven Dating:
+
+"{payload.message}"
+
+💬 Reply on Haven: https://havenpositive.online/matches
+
+---
+This message was sent from your Haven match. You can adjust notification settings in the app.
+        """
+        
+        # HTML version
         email_body = f"""
         <html>
+        <head><title>{subject}</title></head>
         <body style="font-family: Arial, sans-serif; margin: 0; padding: 0; background-color: #fafaf7;">
         <table width="100%" cellpadding="0" cellspacing="0" style="max-width: 600px; margin: 20px auto; background: white; border-radius: 12px; border: 1px solid #e7e5e0;">
             <tr>
                 <td style="padding: 24px;">
-                    <h2 style="color: #7C3AED; margin: 0 0 16px 0;">💜 Haven Dating</h2>
-                    <p style="color: #404040; font-size: 14px; margin: 0 0 16px 0;">
+                    <table cellpadding="0" cellspacing="0" width="100%">
+                        <tr>
+                            <td style="font-size: 24px;">💜</td>
+                            <td style="font-size: 18px; font-weight: bold; color: #7C3AED;">Haven Dating</td>
+                        </tr>
+                    </table>
+                    <p style="color: #404040; font-size: 15px; margin: 20px 0 16px 0;">
+                        Hi,
+                    </p>
+                    <p style="color: #404040; font-size: 15px; margin: 0 0 16px 0;">
                         <strong>{sender_name}</strong> sent you a message on Haven:
                     </p>
-                    <div style="background: #f5f3ee; padding: 16px; border-radius: 8px; margin: 0 0 16px 0; font-size: 14px; color: #404040;">
+                    <div style="background: #f5f3ee; padding: 20px; border-radius: 8px; margin: 0 0 20px 0; font-size: 15px; color: #404040; line-height: 1.5;">
                         {payload.message}
                     </div>
-                    <a href="https://havenpositive.online/matches" 
-                       style="display: inline-block; background: #7C3AED; color: white; padding: 10px 20px; border-radius: 8px; text-decoration: none; font-size: 14px; font-weight: 500;">
-                        💬 Reply on Haven
-                    </a>
-                    <p style="color: #6B6B70; font-size: 11px; margin-top: 20px; border-top: 1px solid #e7e5e0; padding-top: 12px;">
-                        This message was sent from your Haven match. If you no longer wish to receive emails, you can adjust your notification settings in the app.
+                    <p style="margin: 0 0 16px 0;">
+                        <a href="https://havenpositive.online/matches" 
+                           style="display: inline-block; background: #7C3AED; color: white; padding: 12px 24px; border-radius: 8px; text-decoration: none; font-size: 15px; font-weight: 500;">
+                            💬 Reply on Haven
+                        </a>
+                    </p>
+                    <p style="color: #404040; font-size: 14px; margin: 0 0 8px 0;">
+                        Or copy and paste this link: https://havenpositive.online/matches
+                    </p>
+                    <hr style="border: none; border-top: 1px solid #e7e5e0; margin: 24px 0 0 0;">
+                    <p style="color: #8B8B8B; font-size: 12px; margin: 12px 0 0 0; line-height: 1.5;">
+                        This message was sent from your Haven Dating match. You received this email because you matched with {sender_name} on Haven Dating, the community for HIV-positive individuals.<br><br>
+                        Havenpositive.online - A safe space for connections.<br>
+                        If you no longer wish to receive emails, you can adjust your notification settings in the Haven app.
                     </p>
                 </td>
             </tr>
@@ -2809,7 +2838,8 @@ def send_email_message(payload: EmailPayload, user: dict = Depends(get_current_u
         </body>
         </html>
         """
-        send_email(target_user["email"], subject, email_body)
+        
+        send_email(target_user["email"], subject, email_body, plain_text)
     except Exception as e:
         logger.error(f"Email send failed: {e}")
         raise HTTPException(500, "Failed to send email")
@@ -2830,3 +2860,5 @@ app.include_router(api_router)
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=int(os.environ.get("PORT", 8000)))
+
+
