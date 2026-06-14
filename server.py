@@ -2069,12 +2069,12 @@ def delete_group_comment(group_id: str, message_id: str, comment_id: str, user: 
 # ==================== EMAIL / PASSWORD AUTH ====================
 def send_email(to_email: str, subject: str, body: str):
     brevo_api_key = os.environ.get("BREVO_API_KEY")
-    smtp_from = os.environ.get("SMTP_FROM", "pastperfect@havenpositive.online")
+    smtp_from = os.environ.get("SMTP_FROM", "Haven Dating <pastperfect@havenpositive.online>")
     if not brevo_api_key:
         logger.info(f"Brevo API key not configured – email not sent.")
         return
     payload = {
-        "sender": {"name": "Haven", "email": smtp_from},
+        "sender": {"name": "Haven Dating", "email": "pastperfect@havenpositive.online"},
         "to": [{"email": to_email}],
         "subject": subject,
         "htmlContent": body,
@@ -2758,47 +2758,62 @@ class EmailPayload(BaseModel):
     user_id: str
     subject: str
     message: str
-
-
 @api_router.post("/email/send")
+
+
+
 def send_email_message(payload: EmailPayload, user: dict = Depends(get_current_user)):
     """Send an email to a matched user. Free for all verified users."""
     
-    # Check verification
     if not user.get("verified"):
         raise HTTPException(400, "Only verified users can send email messages")
     
-    # Get target user's email
     target_user = _maybe(sb.table("users").select("email").eq("user_id", payload.user_id).maybe_single().execute())
     if not target_user or not target_user.get("email"):
         raise HTTPException(400, "This user's email is not available")
     
-    # Verify they are matched (either dating or friends)
     uid1, uid2 = sorted([user["user_id"], payload.user_id])
     match = _maybe(sb.table("profile_matches").select("*").eq("user1_id", uid1).eq("user2_id", uid2).maybe_single().execute())
     if not match:
         raise HTTPException(403, "You can only send emails to matched users")
     
-    # Get sender's display name
     sender_profile = _maybe(sb.table("user_profiles").select("display_name").eq("user_id", user["user_id"]).maybe_single().execute())
     sender_name = sender_profile.get("display_name", "Someone") if sender_profile else "Someone"
     
-    # Send the email
+    subject = payload.subject or f"You have a message from {sender_name}"
+    
     try:
         email_body = f"""
-        <h2>💜 Haven Dating</h2>
-        <p><strong>{sender_name}</strong> sent you a message:</p>
-        <blockquote style="background:#f5f3ee;padding:12px;border-radius:8px;">
-            {payload.message}
-        </blockquote>
-        <p>💬 <a href="https://havenpositive.online/matches">Chat on Haven</a></p>
+        <html>
+        <body style="font-family: Arial, sans-serif; margin: 0; padding: 0; background-color: #fafaf7;">
+        <table width="100%" cellpadding="0" cellspacing="0" style="max-width: 600px; margin: 20px auto; background: white; border-radius: 12px; border: 1px solid #e7e5e0;">
+            <tr>
+                <td style="padding: 24px;">
+                    <h2 style="color: #7C3AED; margin: 0 0 16px 0;">💜 Haven Dating</h2>
+                    <p style="color: #404040; font-size: 14px; margin: 0 0 16px 0;">
+                        <strong>{sender_name}</strong> sent you a message on Haven:
+                    </p>
+                    <div style="background: #f5f3ee; padding: 16px; border-radius: 8px; margin: 0 0 16px 0; font-size: 14px; color: #404040;">
+                        {payload.message}
+                    </div>
+                    <a href="https://havenpositive.online/matches" 
+                       style="display: inline-block; background: #7C3AED; color: white; padding: 10px 20px; border-radius: 8px; text-decoration: none; font-size: 14px; font-weight: 500;">
+                        💬 Reply on Haven
+                    </a>
+                    <p style="color: #6B6B70; font-size: 11px; margin-top: 20px; border-top: 1px solid #e7e5e0; padding-top: 12px;">
+                        This message was sent from your Haven match. If you no longer wish to receive emails, you can adjust your notification settings in the app.
+                    </p>
+                </td>
+            </tr>
+        </table>
+        </body>
+        </html>
         """
-        send_email(target_user["email"], payload.subject or f"Message from {sender_name}", email_body)
+        send_email(target_user["email"], subject, email_body)
     except Exception as e:
         logger.error(f"Email send failed: {e}")
         raise HTTPException(500, "Failed to send email")
     
-    # Notify the recipient
     notify_user(
         payload.user_id,
         "email_message",
@@ -2815,5 +2830,3 @@ app.include_router(api_router)
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=int(os.environ.get("PORT", 8000)))
-
-
