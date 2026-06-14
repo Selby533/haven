@@ -879,6 +879,7 @@ def get_profile(user: dict) -> dict:
             "location_source": "none",
             "last_active": user.get("last_active"),
             "verified": False, "premium_tier": None,
+            "phone_number": "",   # ← ADD THIS LINE
             "visible_to": "all", "pref_sexual_orientation": "", "lock_all_images": False
         }
     lat = profile.get("gps_latitude"); lon = profile.get("gps_longitude")
@@ -913,6 +914,7 @@ def get_profile(user: dict) -> dict:
         "hide_from_min_age": profile.get("hide_from_min_age"),
         "hide_from_max_age": profile.get("hide_from_max_age"),
         "hide_from_health_statuses": profile.get("hide_from_health_statuses",""),
+        "phone_number": profile.get("phone_number", ""),   # ← ADD THIS LINE
         "visible_to": profile.get("visible_to", "all"),
         "lock_all_images": profile.get("lock_all_images", False),
         "gps_latitude": lat, "gps_longitude": lon,
@@ -2747,5 +2749,3 @@ app.include_router(api_router)
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=int(os.environ.get("PORT", 8000)))
-    
-    
