@@ -313,7 +313,7 @@ class ProfileSetupPayload(BaseModel):
     profile_image: Optional[str] = ""; gallery_images: Optional[List[str]] = []
     pref_gender: Optional[str] = ""; pref_min_age: Optional[int] = 18
     pref_max_age: Optional[int] = 99; pref_country: Optional[str] = ""
-    pref_max_distance: Optional[int] = 5000; pref_health_status: Optional[str] = ""
+    pref_max_distance: Optional[int] = 15000; pref_health_status: Optional[str] = ""
     pref_sexual_orientation: Optional[str] = ""
     profile_hidden: Optional[bool] = False
     hide_from_min_age: Optional[int] = None; hide_from_max_age: Optional[int] = None
@@ -870,7 +870,7 @@ def get_profile(user: dict) -> dict:
             "profile_image": user.get("picture",""), "gallery_images": [],
             "onboarding_complete": False,
             "pref_gender": "", "pref_min_age": 18, "pref_max_age": 99,
-            "pref_country": "", "pref_max_distance": 50, "pref_health_status": "",
+            "pref_country": "", "pref_max_distance": 15000, "pref_health_status": "",
             "profile_hidden": False, "hide_from_min_age": None, "hide_from_max_age": None,
             "hide_from_health_statuses": "",
             "gps_latitude": None, "gps_longitude": None, "gps_verified_at": None,
