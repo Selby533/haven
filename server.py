@@ -15,7 +15,7 @@ try:
     import pillow_heif
     pillow_heif.register_heif_opener()
 except ImportError:
-    pass  # HEIC uploads will fail gracefully (400 error) if not installed
+    pass
 
 import bcrypt
 import threading
@@ -71,10 +71,12 @@ def check_rate_limit(key: str, max_req: int = 10, window: int = 60):
             timestamps.append(now)
             _in_memory_store[key] = timestamps
 
+# ==================== LIFESPAN ====================
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     get_async_client()
     _cache_countries()
+    ensure_public_chats()
     yield
     if _async_client:
         await _async_client.aclose()
@@ -108,7 +110,7 @@ GOLD_COST = 39
 GOLD_DAYS = 30
 PREMIUM_COST = 199
 PREMIUM_DAYS = 180
-MAX_IMAGE_BASE64_SIZE = 5 * 1024 * 1024  # 5 MB
+MAX_IMAGE_BASE64_SIZE = 5 * 1024 * 1024
 
 PROFANITY_LIST = {"fuck","shit","bitch","asshole","bastard","dick","pussy","cunt","whore"}
 ETHNICITY_LIST = [
@@ -146,7 +148,6 @@ def haversine(lat1, lon1, lat2, lon2):
     a = math.sin(dlat/2)**2 + math.cos(math.radians(lat1)) * math.cos(math.radians(lat2)) * math.sin(dlon/2)**2
     return round(EARTH_RADIUS_KM * 2 * math.atan2(math.sqrt(a), math.sqrt(1-a)), 1)
 
-# ---------- Atomic resource spending (loop, no recursion) ----------
 def spend_diamonds(user_id: str, amount: int, item: str, log_purchase: bool = True):
     for attempt in range(3):
         res = sb.table("users").select("diamonds").eq("user_id", user_id).single().execute()
@@ -183,9 +184,7 @@ def spend_tokens(user_id: str, amount: int):
             return new_balance
     raise HTTPException(409, "Balance conflict, please retry")
 
-# ---------- Atomic diamond increment (for PayPal/Google Play) ----------
 def increment_diamonds(user_id: str, amount: int) -> int:
-    """Increase diamonds atomically via Supabase RPC."""
     try:
         result = sb.rpc('increment_diamonds', {'uid': user_id, 'amt': amount}).execute()
         if not result.data:
@@ -195,7 +194,6 @@ def increment_diamonds(user_id: str, amount: int) -> int:
         logger.error(f"increment_diamonds failed: {e}")
         raise HTTPException(500, "Diamond update error")
 
-# ---------- Reverse geocode (async) ----------
 async def reverse_geocode(lat: float, lon: float) -> tuple:
     try:
         client = get_async_client()
@@ -226,7 +224,6 @@ async def get_location_from_ip(ip: str) -> dict:
         logger.error(f"IP geolocation failed: {e}")
     return None
 
-# ---------- Image Helpers ----------
 def compress_image(base64_str: str, max_size_kb: int = 300) -> bytes:
     if len(base64_str) > MAX_IMAGE_BASE64_SIZE:
         raise HTTPException(400, "Image too large (max 5 MB)")
@@ -251,7 +248,6 @@ def upload_image_to_supabase(file_bytes: bytes, user_id: str, filename: str) -> 
     return f"{SUPABASE_URL}/storage/v1/object/public/{STORAGE_BUCKET}/{path}"
 
 def process_image_field(image_value: str, user_id: str, filename_prefix: str) -> str:
-    """Compress, upload, and return URL. Caller must handle cleanup on DB insert failure."""
     if not image_value: return image_value
     if image_value.startswith("data:image") or (len(image_value) > 1000 and "base64" in image_value):
         if len(image_value) > MAX_IMAGE_BASE64_SIZE:
@@ -267,7 +263,6 @@ def process_image_field(image_value: str, user_id: str, filename_prefix: str) ->
             return image_value
     return image_value
 
-# ---------- Realtime notification helper ----------
 def notify_user(user_id: str, ntype: str, message: str, from_user_id: str = "system"):
     nid = f"notif_{uuid.uuid4().hex[:12]}"
     sb.table("notifications").insert({"notification_id": nid, "user_id": user_id, "from_user_id": from_user_id, "type": ntype, "message": message, "created_at": datetime.now(timezone.utc).isoformat()}).execute()
@@ -277,7 +272,6 @@ def notify_user(user_id: str, ntype: str, message: str, from_user_id: str = "sys
     except Exception as e:
         logger.error(f"Realtime broadcast failed: {e}")
 
-# ---------- Premium helpers ----------
 def is_premium(user: dict) -> bool:
     tier = user.get("premium_tier")
     if not tier: return False
@@ -290,6 +284,20 @@ def require_token(user: dict, cost: int = 1):
     if user.get("tokens", 0) < cost:
         raise HTTPException(status_code=402, detail=f"You need {cost} token(s). Earn them in the balloon game or upgrade to premium.")
     user["tokens"] = spend_tokens(user["user_id"], cost)
+
+# ---------- Client detection ----------
+def is_web_client(request: Request) -> bool:
+    origin = request.headers.get("origin", "")
+    referer = request.headers.get("referer", "")
+    web_domains = ["havenpositive.online", "haven-83b20.web.app", "haven-83b20.firebaseapp.com", "localhost:3000"]
+    for domain in web_domains:
+        if domain in origin or domain in referer:
+            return True
+    user_agent = request.headers.get("user-agent", "").lower()
+    browser_signatures = ["mozilla", "chrome", "safari", "firefox", "edge"]
+    if any(sig in user_agent for sig in browser_signatures) and "flutter" not in user_agent and "dart" not in user_agent:
+        return True
+    return False
 
 # ---------- Models ----------
 class LocationUpdatePayload(BaseModel):
@@ -385,6 +393,11 @@ class AdminVerifyUserPayload(BaseModel):
     user_id: str
     verified: bool = True
 
+class PublicChatMessagePayload(BaseModel):
+    content: str
+    chat_type: str
+    reply_to_id: Optional[str] = None
+
 # ---------- Auth dependency ----------
 def get_current_user(
     request: Request,
@@ -403,7 +416,6 @@ def get_current_user(
     if user.get("deleted"):
         raise HTTPException(status_code=401, detail="Account deleted")
 
-    # Auto‑renew / expiry check
     old_tier = user.get("premium_tier")
     if old_tier and not is_premium(user):
         if user.get("auto_renew"):
@@ -435,7 +447,6 @@ def get_current_user(
             user["premium_tier"] = None
             user["premium_expires_at"] = None
 
-    # Debounced last_active update
     last_active = user.get("last_active")
     now = datetime.now(timezone.utc)
     if not last_active or (now - _parse_dt(last_active)) >= timedelta(minutes=5):
@@ -583,7 +594,6 @@ def toggle_auto_renew(user: dict = Depends(get_current_user)):
     sb.table("users").update({"auto_renew": new_val}).eq("user_id", user["user_id"]).execute()
     return {"ok": True, "auto_renew": new_val}
 
-# ---------- PayPal Diamond Purchase (using RPC) ----------
 PAYPAL_API_BASE = "https://api-m.paypal.com"
 
 @api_router.post("/diamonds/create-order")
@@ -596,13 +606,11 @@ async def create_diamond_order(package_id: str, request: Request, user: dict = D
     }
     if package_id not in packages:
         raise HTTPException(400, "Invalid package")
-
     pkg = packages[package_id]
     PAYPAL_CLIENT_ID = os.environ.get("PAYPAL_CLIENT_ID")
     PAYPAL_CLIENT_SECRET = os.environ.get("PAYPAL_CLIENT_SECRET")
     if not PAYPAL_CLIENT_ID or not PAYPAL_CLIENT_SECRET:
         raise HTTPException(500, "PayPal credentials not configured")
-
     client = get_async_client()
     auth_response = await client.post(
         f"{PAYPAL_API_BASE}/v1/oauth2/token",
@@ -612,9 +620,7 @@ async def create_diamond_order(package_id: str, request: Request, user: dict = D
     )
     if auth_response.status_code != 200:
         raise HTTPException(500, "PayPal authentication failed")
-
     access_token = auth_response.json()["access_token"]
-
     order_data = {
         "intent": "CAPTURE",
         "purchase_units": [{
@@ -630,7 +636,6 @@ async def create_diamond_order(package_id: str, request: Request, user: dict = D
             "cancel_url": "https://havenpositive.online/shop",
         }
     }
-
     order_response = await client.post(
         f"{PAYPAL_API_BASE}/v2/checkout/orders",
         json=order_data,
@@ -638,7 +643,6 @@ async def create_diamond_order(package_id: str, request: Request, user: dict = D
     )
     if order_response.status_code != 201:
         raise HTTPException(500, "PayPal order creation failed")
-
     return order_response.json()
 
 @api_router.post("/diamonds/capture-order")
@@ -646,12 +650,10 @@ async def capture_diamond_order(order_id: str, package_id: str, user: dict = Dep
     already = sb.table("diamond_purchases").select("purchase_id").eq("paypal_order_id", order_id).maybe_single().execute()
     if already.data:
         raise HTTPException(409, "Order already processed")
-
     PAYPAL_CLIENT_ID = os.environ.get("PAYPAL_CLIENT_ID")
     PAYPAL_CLIENT_SECRET = os.environ.get("PAYPAL_CLIENT_SECRET")
     if not PAYPAL_CLIENT_ID or not PAYPAL_CLIENT_SECRET:
         raise HTTPException(500, "PayPal credentials not configured")
-
     client = get_async_client()
     auth_response = await client.post(
         f"{PAYPAL_API_BASE}/v1/oauth2/token",
@@ -661,28 +663,23 @@ async def capture_diamond_order(order_id: str, package_id: str, user: dict = Dep
     )
     if auth_response.status_code != 200:
         raise HTTPException(500, "PayPal authentication failed")
-
     access_token = auth_response.json()["access_token"]
-
     capture_response = await client.post(
         f"{PAYPAL_API_BASE}/v2/checkout/orders/{order_id}/capture",
         headers={"Content-Type": "application/json", "Authorization": f"Bearer {access_token}"},
     )
     if capture_response.status_code not in (200, 201):
         raise HTTPException(500, "Payment capture failed")
-
     capture_data = capture_response.json()
     try:
         custom_id = capture_data["purchase_units"][0]["payments"]["captures"][0]["custom_id"]
         _, real_package_id = custom_id.split(":", 1)
     except (KeyError, ValueError):
         raise HTTPException(400, "Invalid PayPal capture data")
-
     packages = {"52": 52, "120": 120, "310": 310, "770": 770}
     diamonds = packages.get(real_package_id)
     if not diamonds:
         raise HTTPException(400, "Invalid package")
-
     purchase_record = {
         "purchase_id": f"diam_{uuid.uuid4().hex[:12]}",
         "user_id": user["user_id"],
@@ -692,35 +689,28 @@ async def capture_diamond_order(order_id: str, package_id: str, user: dict = Dep
         "paypal_order_id": order_id
     }
     sb.table("diamond_purchases").insert(purchase_record).execute()
-
     new_diamonds = increment_diamonds(user["user_id"], diamonds)
     return {"ok": True, "diamonds": new_diamonds}
 
-# ---------- Google Play Purchase (RPC + idempotency) ----------
 @api_router.post("/purchase/google-play")
 def verify_google_purchase(payload: dict, user: dict = Depends(get_current_user)):
     product_id = payload.get("product_id")
     purchase_token = payload.get("purchase_token")
     if not product_id or not purchase_token:
         raise HTTPException(400, "Missing product_id or purchase_token")
-
     already = sb.table("diamond_purchases").select("purchase_id").eq("google_purchase_token", purchase_token).maybe_single().execute()
     if already.data:
         raise HTTPException(409, "Purchase already processed")
-
     diamond_map = {"diamonds_52": 52, "diamonds_120": 120, "diamonds_310": 310, "diamonds_770": 770}
     diamonds = diamond_map.get(product_id)
     if not diamonds:
         raise HTTPException(400, "Invalid product_id")
-
     try:
         creds_json = os.environ.get("GOOGLE_SERVICE_ACCOUNT_JSON")
         if not creds_json:
             raise HTTPException(500, "Service account not configured")
-
         from google.oauth2 import service_account
         from googleapiclient.discovery import build
-
         credentials = service_account.Credentials.from_service_account_info(
             json.loads(creds_json),
             scopes=["https://www.googleapis.com/auth/androidpublisher"],
@@ -731,7 +721,6 @@ def verify_google_purchase(payload: dict, user: dict = Depends(get_current_user)
             productId=product_id,
             token=purchase_token,
         ).execute()
-
         if result.get("purchaseState") == 0:
             service.purchases().products().acknowledge(
                 packageName="date.perfecthorse.havenpositive",
@@ -739,7 +728,6 @@ def verify_google_purchase(payload: dict, user: dict = Depends(get_current_user)
                 token=purchase_token,
                 body={}
             ).execute()
-
             sb.table("diamond_purchases").insert({
                 "purchase_id": f"diam_{uuid.uuid4().hex[:12]}",
                 "user_id": user["user_id"],
@@ -748,7 +736,6 @@ def verify_google_purchase(payload: dict, user: dict = Depends(get_current_user)
                 "purchased_at": datetime.now(timezone.utc).isoformat(),
                 "google_purchase_token": purchase_token
             }).execute()
-
             new_diamonds = increment_diamonds(user["user_id"], diamonds)
             return {"ok": True, "diamonds": new_diamonds}
         else:
@@ -757,7 +744,6 @@ def verify_google_purchase(payload: dict, user: dict = Depends(get_current_user)
         logger.exception("Google Play verification failed")
         raise HTTPException(400, f"Purchase verification failed: {str(e)}")
 
-# ---------- Earn tokens ----------
 @api_router.post("/earn-tokens")
 def earn_tokens(user: dict = Depends(get_current_user)):
     if is_premium(user):
@@ -786,7 +772,6 @@ def earn_tokens_ad(user: dict = Depends(get_current_user)):
 
 @api_router.post("/earn-tokens-rewarded")
 def earn_tokens_rewarded(user: dict = Depends(get_current_user)):
-    """Rewarded ad – gives 7 tokens, same cooldown as regular ad earning."""
     if is_premium(user):
         raise HTTPException(400, "Premium members don't earn tokens")
     last_earn = user.get("last_ad_token_earned")
@@ -1127,9 +1112,10 @@ def update_profile(payload: ProfileUpdatePayload, user: dict = Depends(get_curre
 def get_my_profile(user: dict = Depends(get_current_user)):
     return get_profile(user)
 
-# ---------- Discovery (TOKEN DEDUCTION REMOVED) ----------
+# ---------- Discovery (WEB CLIENTS PAY TOKENS, APP IS FREE) ----------
 @api_router.get("/discover/profiles")
 def get_discover_profiles(
+    request: Request,
     user: dict = Depends(get_current_user),
     page: Optional[int] = None,
     limit: Optional[int] = None,
@@ -1165,7 +1151,6 @@ def get_discover_profiles(
         partner = m["user2_id"] if m["user1_id"] == user["user_id"] else m["user1_id"]
         matched_ids.add(partner)
 
-    # Build base query with all non-distance filters
     query = sb.table("user_profiles").select(
         "user_id,display_name,date_of_birth,profile_image,gallery_images,gender,country,city,gps_latitude,gps_longitude,health_status,sexual_orientation,religion,ethnicity,height,bio,interests,looking_for,education,kids,want_kids,smoke,drink,employment,profile_hidden,visible_to,lock_all_images,pref_gender,pref_health_status,pref_sexual_orientation,pref_country,pref_max_distance,pref_min_age,pref_max_age,hide_from_min_age,hide_from_max_age,hide_from_health_statuses,onboarding_complete,location_source,gps_verified_at,latitude,longitude,updated_at",
         count="exact"
@@ -1192,8 +1177,6 @@ def get_discover_profiles(
     for mid in matched_ids:
         query = query.neq("user_id", mid)
 
-    # Fetch ALL matching profiles (without distance limit)
-    # We'll filter by distance in Python, but we need to fetch enough to not miss nearby ones
     all_profiles = query.execute().data or []
     
     if not all_profiles:
@@ -1203,7 +1186,6 @@ def get_discover_profiles(
     users_data = sb.table("users").select("user_id,verified,premium_tier,last_active").in_("user_id", user_ids).execute().data or []
     user_status = {u["user_id"]: u for u in users_data}
 
-    # Calculate distances and filter
     filtered = []
     for p in all_profiles:
         if p.get("profile_hidden"): continue
@@ -1212,7 +1194,6 @@ def get_discover_profiles(
         distance = None
         if p_lat is not None and p_lon is not None:
             distance = haversine(my_lat, my_lon, p_lat, p_lon)
-            # Apply distance filter
             if pref_max_distance and distance > pref_max_distance: continue
         p["distance_km"] = round(distance, 1) if distance is not None else None
         status = user_status.get(p["user_id"], {})
@@ -1221,25 +1202,25 @@ def get_discover_profiles(
         p["last_active"] = status.get("last_active")
         filtered.append(p)
 
-    # Sort by distance (closest first)
     filtered.sort(key=lambda x: x.get("distance_km") or float('inf'))
 
-    # Apply pagination AFTER filtering
     if page is not None and limit is not None:
         start = (page - 1) * limit
         end = start + limit
         filtered = filtered[start:end]
 
+    # Conditionally charge tokens only for web clients
+    if not is_premium(user) and is_web_client(request):
+        require_token(user, len(filtered))
+
     return filtered
 
-
-
-
-
-
 @api_router.post("/discover/swipe")
-def swipe_profile(payload: SwipePayload, user: dict = Depends(get_current_user)):
-    # Token deduction REMOVED – swiping is free (ad-supported)
+def swipe_profile(payload: SwipePayload, request: Request, user: dict = Depends(get_current_user)):
+    # Conditionally charge tokens only for web clients
+    if not is_premium(user) and is_web_client(request):
+        require_token(user, 1)
+    
     if payload.direction not in ["like","pass"]: raise HTTPException(400)
     target = _maybe(sb.table("user_profiles").select("user_id").eq("user_id", payload.swiped_id).maybe_single().execute())
     if not target: raise HTTPException(404)
@@ -1614,10 +1595,12 @@ def build_comment_tree(comments):
         else: roots.append(node)
     return roots
 
-# ---------- Random Chat (TOKEN DEDUCTION REMOVED) ----------
+# ---------- Random Chat ----------
 @api_router.post("/chat/start")
-def chat_start(user: dict = Depends(get_current_user)):
-    # Token deduction REMOVED – chat is free (ad-supported)
+def chat_start(request: Request, user: dict = Depends(get_current_user)):
+    # Conditionally charge tokens only for web clients
+    if not is_premium(user) and is_web_client(request):
+        require_token(user, 1)
     return {"ok": True}
 
 # ---------- Flexer Board ----------
@@ -1702,7 +1685,7 @@ def _cache_countries():
 
 _cities_cache: Dict[str, tuple[Optional[List[dict]], float]] = {}
 _cities_cache_lock = threading.Lock()
-_CITIES_TTL = 3600  # 1 hour
+_CITIES_TTL = 3600
 
 @api_router.get("/location/countries")
 def get_countries():
@@ -1746,16 +1729,13 @@ def create_group(payload: dict, user: dict = Depends(get_current_user)):
     image = payload.get("image", "")
     join_cost = int(payload.get("join_cost", 0))
     if join_cost < 0: raise HTTPException(400)
-
     spend_diamonds(user["user_id"], 10, "group_creation", log_purchase=True)
-
     if image and (image.startswith("data:image") or "base64" in image):
         compressed = compress_image(image)
         filename = f"group_{uuid.uuid4().hex[:8]}.webp"
         image_url = upload_image_to_supabase(compressed, user["user_id"], filename)
     else:
         image_url = image or ""
-
     group_id = f"grp_{uuid.uuid4().hex[:12]}"
     now = datetime.now(timezone.utc).isoformat()
     sb.table("groups").insert({
@@ -1824,7 +1804,7 @@ def join_group(group_id: str, user: dict = Depends(get_current_user)):
     existing = _maybe(sb.table("group_members").select("role").eq("group_id", group_id).eq("user_id", user["user_id"]).maybe_single().execute())
     if existing: raise HTTPException(400, "Already a member")
     ban = _maybe(sb.table("group_bans").select("banned_until").eq("group_id", group_id).eq("user_id", user["user_id"]).maybe_single().execute())
-    if ban and (ban.get("banned_until") is None or _parse_dt(ban["banned_until"]) > datetime.now(timezone.utc)):
+    if ban and (ban.get("banned_until") is None or _parse_dt(ban["banned_until"]) > datetime.now(timezone.utc):
         raise HTTPException(403, "You are banned")
     join_cost = group.get("join_cost", 0)
     if join_cost > 0:
@@ -2456,9 +2436,8 @@ def get_user_profile(user_id: str):
     if not profile: raise HTTPException(404, "User not found")
     return profile
 
-# # ==================== PUBLIC CHATS ====================
+# ==================== PUBLIC CHATS ====================
 
-# Create the three default public chats if they don't exist (run once)
 def ensure_public_chats():
     """Create HIV, HSV, HPV public chats if they don't exist."""
     for chat_type in ["HIV", "HSV", "HPV"]:
@@ -2472,31 +2451,18 @@ def ensure_public_chats():
                 "created_at": datetime.now(timezone.utc).isoformat()
             }).execute()
 
-
-class PublicChatMessagePayload(BaseModel):
-    content: str
-    chat_type: str
-    reply_to_id: Optional[str] = None   # ← ADDED
-
-
 @api_router.get("/public-chats")
 def get_public_chats(user: dict = Depends(get_current_user)):
-    """Get list of available public chats."""
     chats = sb.table("public_chats").select("*").execute().data or []
     result = []
     for chat in chats:
-        # Get last message for preview
         last_msg = sb.table("public_chat_messages").select("*").eq("chat_id", chat["chat_id"]).order("created_at", desc=True).limit(1).execute().data
         last_message = last_msg[0] if last_msg else None
-        # Get online count (active in last 5 minutes)
         five_min_ago = (datetime.now(timezone.utc) - timedelta(minutes=5)).isoformat()
-        # Count unique senders in last 5 minutes
         active_senders = sb.table("public_chat_messages").select("sender_id").eq("chat_id", chat["chat_id"]).gte("created_at", five_min_ago).execute().data or []
         active_count = len(set(m["sender_id"] for m in active_senders))
-        # Get total message count
         total_res = sb.table("public_chat_messages").select("message_id", count="exact").eq("chat_id", chat["chat_id"]).execute()
         total_count = total_res.count if hasattr(total_res, 'count') else 0
-        
         result.append({
             "chat_id": chat["chat_id"],
             "chat_type": chat["chat_type"],
@@ -2508,43 +2474,33 @@ def get_public_chats(user: dict = Depends(get_current_user)):
         })
     return result
 
-
 @api_router.get("/public-chats/{chat_id}/messages")
 def get_public_chat_messages(chat_id: str, limit: int = 50, user: dict = Depends(get_current_user)):
-    """Get messages for a public chat."""
     chat = _maybe(sb.table("public_chats").select("*").eq("chat_id", chat_id).maybe_single().execute())
     if not chat:
         raise HTTPException(404, "Chat not found")
-    
     msgs = sb.table("public_chat_messages").select("*").eq("chat_id", chat_id).order("created_at", desc=True).limit(limit).execute().data or []
     msgs.reverse()
-    
-    # Get sender profiles
     sender_ids = list({m["sender_id"] for m in msgs})
     profiles = {}
     if sender_ids:
         prof_data = sb.table("user_profiles").select("user_id,display_name,profile_image").in_("user_id", sender_ids).execute().data or []
         profiles = {p["user_id"]: p for p in prof_data}
-    
-    # Build reply lookup for messages that have reply_to_id
     reply_ids = [m.get("reply_to_id") for m in msgs if m.get("reply_to_id")]
     reply_map = {}
     if reply_ids:
         reply_data = sb.table("public_chat_messages").select("message_id,sender_id,content").in_("message_id", reply_ids).execute().data or []
-        # Get sender names for replies
         reply_sender_ids = list({r["sender_id"] for r in reply_data})
         reply_profiles = {}
         if reply_sender_ids:
             rp = sb.table("user_profiles").select("user_id,display_name").in_("user_id", reply_sender_ids).execute().data or []
             reply_profiles = {r["user_id"]: r for r in rp}
-        
         for r in reply_data:
             rp = reply_profiles.get(r["sender_id"], {})
             reply_map[r["message_id"]] = {
                 "sender_name": rp.get("display_name", "Someone"),
                 "content": r["content"],
             }
-    
     result = []
     for msg in msgs:
         prof = profiles.get(msg["sender_id"], {})
@@ -2557,27 +2513,20 @@ def get_public_chat_messages(chat_id: str, limit: int = 50, user: dict = Depends
             "content": msg["content"],
             "created_at": msg["created_at"],
         }
-        # Include reply info if present
         if msg.get("reply_to_id") and msg["reply_to_id"] in reply_map:
             item["reply_to"] = reply_map[msg["reply_to_id"]]
         result.append(item)
-    
     return result
-
 
 @api_router.post("/public-chats/{chat_id}/messages")
 def send_public_chat_message(chat_id: str, payload: PublicChatMessagePayload, user: dict = Depends(get_current_user)):
-    """Send a message to a public chat."""
     if contains_profanity(payload.content):
         raise HTTPException(400, "Message contains inappropriate language")
-    
     chat = _maybe(sb.table("public_chats").select("*").eq("chat_id", chat_id).maybe_single().execute())
     if not chat:
         raise HTTPException(404, "Chat not found")
-    
     message_id = f"pubmsg_{uuid.uuid4().hex[:12]}"
     now = datetime.now(timezone.utc).isoformat()
-    
     insert_data = {
         "message_id": message_id,
         "chat_id": chat_id,
@@ -2587,12 +2536,8 @@ def send_public_chat_message(chat_id: str, payload: PublicChatMessagePayload, us
     }
     if payload.reply_to_id:
         insert_data["reply_to_id"] = payload.reply_to_id
-    
     sb.table("public_chat_messages").insert(insert_data).execute()
-    
-    # Get sender profile for response
     profile = _maybe(sb.table("user_profiles").select("display_name,profile_image").eq("user_id", user["user_id"]).maybe_single().execute())
-    
     response_msg = {
         "message_id": message_id,
         "chat_id": chat_id,
@@ -2602,8 +2547,6 @@ def send_public_chat_message(chat_id: str, payload: PublicChatMessagePayload, us
         "content": payload.content.strip(),
         "created_at": now,
     }
-    
-    # If replying, include the reply info in response
     if payload.reply_to_id:
         reply_msg = _maybe(sb.table("public_chat_messages").select("message_id,sender_id,content").eq("message_id", payload.reply_to_id).maybe_single().execute())
         if reply_msg:
@@ -2612,22 +2555,17 @@ def send_public_chat_message(chat_id: str, payload: PublicChatMessagePayload, us
                 "sender_name": reply_prof.get("display_name", "Someone") if reply_prof else "Someone",
                 "content": reply_msg["content"],
             }
-    
     return {"ok": True, "message": response_msg}
-
 
 @api_router.delete("/public-chats/messages/{message_id}")
 def delete_public_chat_message(message_id: str, user: dict = Depends(get_current_user)):
-    """Delete own message from public chat."""
     msg = _maybe(sb.table("public_chat_messages").select("*").eq("message_id", message_id).maybe_single().execute())
     if not msg:
         raise HTTPException(404, "Message not found")
     if msg["sender_id"] != user["user_id"] and not user.get("is_admin"):
         raise HTTPException(403, "Cannot delete this message")
-    
     sb.table("public_chat_messages").delete().eq("message_id", message_id).execute()
     return {"ok": True}
-
 
 # ==================== MOUNT ROUTER ====================
 app.include_router(api_router)
