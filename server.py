@@ -1127,7 +1127,7 @@ def get_discover_profiles(
     pref_min_age = min_age if min_age is not None else viewer_profile.get("pref_min_age", 18)
     pref_max_age = max_age if max_age is not None else viewer_profile.get("pref_max_age", 99)
     pref_country = country if country is not None else viewer_profile.get("pref_country", "")
-    pref_max_distance = max_distance if max_distance is not None else viewer_profile.get("pref_max_distance", 5000)
+    pref_max_distance = max_distance if max_distance is not None else viewer_profile.get("pref_max_distance", 15000)
     pref_sexual_orientation = sexual_orientation if sexual_orientation is not None else viewer_profile.get("pref_sexual_orientation", "")
 
     today = datetime.now(timezone.utc).date()
