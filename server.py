@@ -2456,7 +2456,7 @@ def get_user_profile(user_id: str):
     if not profile: raise HTTPException(404, "User not found")
     return profile
 
-# ==================== PUBLIC CHATS ====================
+# # ==================== PUBLIC CHATS ====================
 
 # Create the three default public chats if they don't exist (run once)
 def ensure_public_chats():
@@ -2472,21 +2472,11 @@ def ensure_public_chats():
                 "created_at": datetime.now(timezone.utc).isoformat()
             }).execute()
 
-# Call on startup
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    get_async_client()
-    _cache_countries()
-    ensure_public_chats()   # ← create default chats
-    yield
-    if _async_client:
-        await _async_client.aclose()
-    http_client_sync.close()
-
 
 class PublicChatMessagePayload(BaseModel):
     content: str
-    chat_type: str   # "HIV", "HSV", or "HPV"
+    chat_type: str
+    reply_to_id: Optional[str] = None   # ← ADDED
 
 
 @api_router.get("/public-chats")
@@ -2501,13 +2491,12 @@ def get_public_chats(user: dict = Depends(get_current_user)):
         # Get online count (active in last 5 minutes)
         five_min_ago = (datetime.now(timezone.utc) - timedelta(minutes=5)).isoformat()
         # Count unique senders in last 5 minutes
-        active_count = len(set(
-            m["sender_id"] for m in (sb.table("public_chat_messages")
-                .select("sender_id")
-                .eq("chat_id", chat["chat_id"])
-                .gte("created_at", five_min_ago)
-                .execute().data or [])
-        ))
+        active_senders = sb.table("public_chat_messages").select("sender_id").eq("chat_id", chat["chat_id"]).gte("created_at", five_min_ago).execute().data or []
+        active_count = len(set(m["sender_id"] for m in active_senders))
+        # Get total message count
+        total_res = sb.table("public_chat_messages").select("message_id", count="exact").eq("chat_id", chat["chat_id"]).execute()
+        total_count = total_res.count if hasattr(total_res, 'count') else 0
+        
         result.append({
             "chat_id": chat["chat_id"],
             "chat_type": chat["chat_type"],
@@ -2515,7 +2504,7 @@ def get_public_chats(user: dict = Depends(get_current_user)):
             "last_message": last_message["content"][:100] if last_message else None,
             "last_message_time": last_message["created_at"] if last_message else None,
             "active_users": active_count,
-            "total_messages": len(sb.table("public_chat_messages").select("message_id", count="exact").eq("chat_id", chat["chat_id"]).execute().data or []),
+            "total_messages": total_count,
         })
     return result
 
@@ -2537,10 +2526,29 @@ def get_public_chat_messages(chat_id: str, limit: int = 50, user: dict = Depends
         prof_data = sb.table("user_profiles").select("user_id,display_name,profile_image").in_("user_id", sender_ids).execute().data or []
         profiles = {p["user_id"]: p for p in prof_data}
     
+    # Build reply lookup for messages that have reply_to_id
+    reply_ids = [m.get("reply_to_id") for m in msgs if m.get("reply_to_id")]
+    reply_map = {}
+    if reply_ids:
+        reply_data = sb.table("public_chat_messages").select("message_id,sender_id,content").in_("message_id", reply_ids).execute().data or []
+        # Get sender names for replies
+        reply_sender_ids = list({r["sender_id"] for r in reply_data})
+        reply_profiles = {}
+        if reply_sender_ids:
+            rp = sb.table("user_profiles").select("user_id,display_name").in_("user_id", reply_sender_ids).execute().data or []
+            reply_profiles = {r["user_id"]: r for r in rp}
+        
+        for r in reply_data:
+            rp = reply_profiles.get(r["sender_id"], {})
+            reply_map[r["message_id"]] = {
+                "sender_name": rp.get("display_name", "Someone"),
+                "content": r["content"],
+            }
+    
     result = []
     for msg in msgs:
         prof = profiles.get(msg["sender_id"], {})
-        result.append({
+        item = {
             "message_id": msg["message_id"],
             "chat_id": msg["chat_id"],
             "sender_id": msg["sender_id"],
@@ -2548,7 +2556,12 @@ def get_public_chat_messages(chat_id: str, limit: int = 50, user: dict = Depends
             "sender_avatar": prof.get("profile_image", ""),
             "content": msg["content"],
             "created_at": msg["created_at"],
-        })
+        }
+        # Include reply info if present
+        if msg.get("reply_to_id") and msg["reply_to_id"] in reply_map:
+            item["reply_to"] = reply_map[msg["reply_to_id"]]
+        result.append(item)
+    
     return result
 
 
@@ -2565,30 +2578,42 @@ def send_public_chat_message(chat_id: str, payload: PublicChatMessagePayload, us
     message_id = f"pubmsg_{uuid.uuid4().hex[:12]}"
     now = datetime.now(timezone.utc).isoformat()
     
-    sb.table("public_chat_messages").insert({
+    insert_data = {
         "message_id": message_id,
         "chat_id": chat_id,
         "sender_id": user["user_id"],
         "content": payload.content.strip(),
-        "reply_to_id": payload.reply_to_id, 
         "created_at": now
-    }).execute()
+    }
+    if payload.reply_to_id:
+        insert_data["reply_to_id"] = payload.reply_to_id
+    
+    sb.table("public_chat_messages").insert(insert_data).execute()
     
     # Get sender profile for response
     profile = _maybe(sb.table("user_profiles").select("display_name,profile_image").eq("user_id", user["user_id"]).maybe_single().execute())
     
-    return {
-        "ok": True,
-        "message": {
-            "message_id": message_id,
-            "chat_id": chat_id,
-            "sender_id": user["user_id"],
-            "sender_name": profile.get("display_name", user.get("name", "Anonymous")) if profile else user.get("name", "Anonymous"),
-            "sender_avatar": profile.get("profile_image", "") if profile else "",
-            "content": payload.content.strip(),
-            "created_at": now,
-        }
+    response_msg = {
+        "message_id": message_id,
+        "chat_id": chat_id,
+        "sender_id": user["user_id"],
+        "sender_name": profile.get("display_name", user.get("name", "Anonymous")) if profile else user.get("name", "Anonymous"),
+        "sender_avatar": profile.get("profile_image", "") if profile else "",
+        "content": payload.content.strip(),
+        "created_at": now,
     }
+    
+    # If replying, include the reply info in response
+    if payload.reply_to_id:
+        reply_msg = _maybe(sb.table("public_chat_messages").select("message_id,sender_id,content").eq("message_id", payload.reply_to_id).maybe_single().execute())
+        if reply_msg:
+            reply_prof = _maybe(sb.table("user_profiles").select("display_name").eq("user_id", reply_msg["sender_id"]).maybe_single().execute())
+            response_msg["reply_to"] = {
+                "sender_name": reply_prof.get("display_name", "Someone") if reply_prof else "Someone",
+                "content": reply_msg["content"],
+            }
+    
+    return {"ok": True, "message": response_msg}
 
 
 @api_router.delete("/public-chats/messages/{message_id}")
@@ -2602,8 +2627,6 @@ def delete_public_chat_message(message_id: str, user: dict = Depends(get_current
     
     sb.table("public_chat_messages").delete().eq("message_id", message_id).execute()
     return {"ok": True}
-
-
 
 
 # ==================== MOUNT ROUTER ====================
