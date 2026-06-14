@@ -1849,6 +1849,10 @@ def change_member_role(group_id: str, user_id: str, payload: dict, user: dict = 
 @api_router.post("/groups/{group_id}/messages")
 def send_group_message(group_id: str, payload: dict, user: dict = Depends(get_current_user)):
     content = payload.get("content", "")
+    reply_to_id = payload.get("reply_to_id")
+    reply_to_content = payload.get("reply_to_content", "")
+    reply_to_sender = payload.get("reply_to_sender", "")
+    
     if not content.strip(): raise HTTPException(400)
     if contains_profanity(content): raise HTTPException(400)
     member = _maybe(sb.table("group_members").select("role").eq("group_id", group_id).eq("user_id", user["user_id"]).maybe_single().execute())
@@ -1862,11 +1866,37 @@ def send_group_message(group_id: str, payload: dict, user: dict = Depends(get_cu
         if msg_count >= 2:
             require_token(user, 1)
     message_id = f"gm_{uuid.uuid4().hex[:12]}"
-    sb.table("group_messages").insert({
-        "message_id": message_id, "group_id": group_id, "sender_id": user["user_id"],
-        "content": content.strip(), "created_at": datetime.now(timezone.utc).isoformat()
-    }).execute()
-    return {"ok": True, "message_id": message_id}
+    
+    insert_data = {
+        "message_id": message_id,
+        "group_id": group_id,
+        "sender_id": user["user_id"],
+        "content": content.strip(),
+        "created_at": datetime.now(timezone.utc).isoformat()
+    }
+    if reply_to_id:
+        insert_data["reply_to_id"] = reply_to_id
+    
+    sb.table("group_messages").insert(insert_data).execute()
+    
+    # Get sender's display_name
+    profile = _maybe(sb.table("user_profiles").select("display_name").eq("user_id", user["user_id"]).maybe_single().execute())
+    
+    response = {
+        "ok": True,
+        "message_id": message_id,
+        "sender_name": profile.get("display_name", "Unknown") if profile else "Unknown",
+    }
+    
+    if reply_to_id:
+        response["reply_to"] = {
+            "message_id": reply_to_id,
+            "sender_name": reply_to_sender,
+            "content": reply_to_content,
+        }
+    
+    return response
+
 
 @api_router.get("/groups/{group_id}/messages")
 def get_group_messages(group_id: str, limit: int = 50, before: Optional[str] = None, user: dict = Depends(get_current_user)):
@@ -1876,14 +1906,38 @@ def get_group_messages(group_id: str, limit: int = 50, before: Optional[str] = N
     if before: query = query.lt("created_at", before)
     msgs = query.execute().data or []
     msgs.reverse()
+    
+    # Get sender display_names from user_profiles
     sender_ids = list({m["sender_id"] for m in msgs})
     sender_names = {}
     if sender_ids:
-        users_data = sb.table("users").select("user_id,name").in_("user_id", sender_ids).execute().data or []
-        sender_names = {u["user_id"]: u["name"] for u in users_data}
+        profiles_data = sb.table("user_profiles").select("user_id,display_name").in_("user_id", sender_ids).execute().data or []
+        sender_names = {p["user_id"]: p.get("display_name", "Unknown") for p in profiles_data}
+    
+    # Build reply lookup
+    reply_ids = [m.get("reply_to_id") for m in msgs if m.get("reply_to_id")]
+    reply_map = {}
+    if reply_ids:
+        reply_data = sb.table("group_messages").select("message_id,sender_id,content").in_("message_id", reply_ids).execute().data or []
+        reply_sender_ids = list({r["sender_id"] for r in reply_data})
+        reply_profiles = {}
+        if reply_sender_ids:
+            rp = sb.table("user_profiles").select("user_id,display_name").in_("user_id", reply_sender_ids).execute().data or []
+            reply_profiles = {r["user_id"]: r for r in rp}
+        for r in reply_data:
+            rp = reply_profiles.get(r["sender_id"], {})
+            reply_map[r["message_id"]] = {
+                "sender_name": rp.get("display_name", "Unknown"),
+                "content": r["content"],
+            }
+    
     for msg in msgs:
         msg["sender_name"] = sender_names.get(msg["sender_id"], "Unknown")
+        if msg.get("reply_to_id") and msg["reply_to_id"] in reply_map:
+            msg["reply_to"] = reply_map[msg["reply_to_id"]]
+    
     return msgs
+
 
 @api_router.delete("/groups/{group_id}/messages/{message_id}")
 def delete_group_message(group_id: str, message_id: str, user: dict = Depends(get_current_user)):
@@ -1986,8 +2040,9 @@ def get_group_comments(group_id: str, message_id: str, user: dict = Depends(get_
     user_ids = list({c["user_id"] for c in comments})
     author_names = {}
     if user_ids:
-        users_data = sb.table("users").select("user_id,name").in_("user_id", user_ids).execute().data or []
-        author_names = {u["user_id"]: u["name"] for u in users_data}
+        # Use display_name from user_profiles
+        profiles_data = sb.table("user_profiles").select("user_id,display_name").in_("user_id", user_ids).execute().data or []
+        author_names = {p["user_id"]: p.get("display_name", "Unknown") for p in profiles_data}
     for c in comments:
         c["author_name"] = author_names.get(c["user_id"], "Unknown")
     return build_comment_tree(comments)
@@ -2004,7 +2059,6 @@ def delete_group_comment(group_id: str, message_id: str, comment_id: str, user: 
             raise HTTPException(403)
     sb.table("group_message_comments").delete().eq("comment_id", comment_id).execute()
     return {"ok": True}
-
 # ==================== EMAIL / PASSWORD AUTH ====================
 def send_email(to_email: str, subject: str, body: str):
     brevo_api_key = os.environ.get("BREVO_API_KEY")
