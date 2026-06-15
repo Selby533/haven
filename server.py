@@ -307,31 +307,45 @@ class GoogleAuthPayload(BaseModel):
     id_token: str; email: str; name: str; picture: str; ref: Optional[str] = None
 
 class ProfileSetupPayload(BaseModel):
-    date_of_birth: str; gender: str; health_status: str
+    date_of_birth: str
+    gender: str
+    health_status: str
     sexual_orientation: Optional[str] = ""
     positive_since: Optional[str] = ""
     height: Optional[str] = ""
     ethnicity: Optional[str] = ""
     religion: Optional[str] = ""
-    display_name: Optional[str] = ""; bio: Optional[str] = ""
-    interests: Optional[str] = ""; looking_for: Optional[str] = ""
-    education: Optional[str] = ""; kids: Optional[str] = ""
-    want_kids: Optional[str] = ""; smoke: Optional[str] = ""
-    drink: Optional[str] = ""; employment: Optional[str] = ""
-    profile_image: Optional[str] = ""; gallery_images: Optional[List[str]] = []
-    pref_gender: Optional[str] = ""; pref_min_age: Optional[int] = 18
-    pref_max_age: Optional[int] = 99; pref_country: Optional[str] = ""
-    pref_max_distance: Optional[int] = 15000; pref_health_status: Optional[str] = ""
+    display_name: Optional[str] = ""
+    bio: Optional[str] = ""
+    interests: Optional[str] = ""
+    looking_for: Optional[str] = ""
+    education: Optional[str] = ""
+    kids: Optional[str] = ""
+    want_kids: Optional[str] = ""
+    smoke: Optional[str] = ""
+    drink: Optional[str] = ""
+    employment: Optional[str] = ""
+    profile_image: Optional[str] = ""
+    gallery_images: Optional[List[str]] = []
+    pref_gender: Optional[str] = ""
+    pref_min_age: Optional[int] = 18
+    pref_max_age: Optional[int] = 99
+    pref_country: Optional[str] = ""
+    pref_max_distance: Optional[int] = 15000
+    pref_health_status: Optional[str] = ""
     pref_sexual_orientation: Optional[str] = ""
+    phone_number: Optional[str] = ""   # ← FIXED: added default value
     profile_hidden: Optional[bool] = False
-    hide_from_min_age: Optional[int] = None; hide_from_max_age: Optional[int] = None
+    hide_from_min_age: Optional[int] = None
+    hide_from_max_age: Optional[int] = None
     hide_from_health_statuses: Optional[str] = ""
     visible_to: Optional[str] = "all"
     lock_all_images: Optional[bool] = False
-    phone_number: Optional[str]
 
     @validator('date_of_birth')
     def validate_age(cls, v):
+        if not v:
+            raise ValueError("Date of birth is required")
         try:
             dob = datetime.strptime(v, "%Y-%m-%d").date()
             today = datetime.now(timezone.utc).date()
@@ -341,8 +355,10 @@ class ProfileSetupPayload(BaseModel):
             if age > 100:
                 raise ValueError("Age must be 100 or less")
             return v
-        except ValueError as e:
-            raise ValueError(str(e))
+        except ValueError:
+            raise
+        except Exception:
+            raise ValueError("Invalid date format. Use YYYY-MM-DD")
 
 class ProfileUpdatePayload(BaseModel):
     date_of_birth: Optional[str] = None; gender: Optional[str] = None; health_status: Optional[str] = None
