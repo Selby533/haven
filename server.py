@@ -917,7 +917,8 @@ def get_profile(user: dict) -> dict:
         "hide_from_health_statuses": profile.get("hide_from_health_statuses",""),
         "phone_number": profile.get("phone_number", ""),   # ← ADD THIS LINE
         "visible_to": profile.get("visible_to", "all"),
-        "lock_all_images": profile.get("lock_all_images", False),
+        "lock_all_images": False,   # force all images visible
+        #"lock_all_images": profile.get("lock_all_images", False),
         "gps_latitude": lat, "gps_longitude": lon,
         "gps_verified_at": profile.get("gps_verified_at"),
         "location_source": profile.get("location_source", "none"),
@@ -1210,7 +1211,11 @@ def get_discover_profiles(
         p["last_active"] = status.get("last_active")
         filtered.append(p)
 
-    #filtered.sort(key=lambda x: x.get("distance_km") or float('inf'))
+    # --- Force all images visible for free users ---
+    for p in filtered:
+        p["lock_all_images"] = False
+
+    # Sort: most recently active first, distance as tie-breaker
     filtered.sort(key=lambda x: x.get("distance_km") or float('inf'))
     filtered.sort(key=lambda x: x.get("last_active") or "", reverse=True)
 
@@ -2864,5 +2869,4 @@ if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=int(os.environ.get("PORT", 8000)))
     
-
 
