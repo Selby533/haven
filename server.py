@@ -1210,7 +1210,9 @@ def get_discover_profiles(
         p["last_active"] = status.get("last_active")
         filtered.append(p)
 
+    #filtered.sort(key=lambda x: x.get("distance_km") or float('inf'))
     filtered.sort(key=lambda x: x.get("distance_km") or float('inf'))
+    filtered.sort(key=lambda x: x.get("last_active") or "", reverse=True)
 
     if page is not None and limit is not None:
         start = (page - 1) * limit
@@ -2861,5 +2863,6 @@ app.include_router(api_router)
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=int(os.environ.get("PORT", 8000)))
+    
 
-
+filtered.sort(key=lambda x: x.get("distance_km") or float('inf'))
