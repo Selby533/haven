@@ -111,6 +111,7 @@ GOLD_DAYS = 30
 PREMIUM_COST = 199
 PREMIUM_DAYS = 180
 MAX_IMAGE_BASE64_SIZE = 5 * 1024 * 1024
+EMAIL_AUTH_ENABLED = os.environ.get("EMAIL_AUTH_ENABLED", "false").lower() == "true"
 
 PROFANITY_LIST = {"fuck","shit","bitch","asshole","bastard","dick","pussy","cunt","whore"}
 ETHNICITY_LIST = [
@@ -362,12 +363,11 @@ class ProfileUpdatePayload(BaseModel):
     pref_max_distance: Optional[int] = None; pref_health_status: Optional[str] = None
     pref_sexual_orientation: Optional[str] = None
     profile_hidden: Optional[bool] = None
-    phone_number: Optional[str] = None   # ← ADD THIS LINE
+    phone_number: Optional[str] = None
     hide_from_min_age: Optional[int] = None; hide_from_max_age: Optional[int] = None
     hide_from_health_statuses: Optional[str] = None
     visible_to: Optional[str] = None
     lock_all_images: Optional[bool] = None
-    
 
 class CreateStoryPayload(BaseModel):
     content: str; category: str; title: Optional[str] = ""
@@ -401,6 +401,17 @@ class PublicChatMessagePayload(BaseModel):
     content: str
     chat_type: str
     reply_to_id: Optional[str] = None
+
+class FeedbackPayload(BaseModel):
+    type: str
+    message: str
+
+class SupportTicketCreatePayload(BaseModel):
+    subject: str
+    message: str
+
+class SupportMessagePayload(BaseModel):
+    content: str
 
 # ---------- Auth dependency ----------
 def get_current_user(
@@ -989,7 +1000,7 @@ def setup_profile(payload: ProfileSetupPayload, user: dict = Depends(get_current
         "pref_max_distance": payload.pref_max_distance or 15000,
         "pref_health_status": payload.pref_health_status or "",
         "pref_sexual_orientation": payload.pref_sexual_orientation or "",
-        "phone_number": payload.phone_number or "",   # ← ADD THIS LINE
+        "phone_number": payload.phone_number or "",
         "profile_hidden": payload.profile_hidden if user.get("verified") else False,
         "hide_from_min_age": payload.hide_from_min_age if user.get("verified") else None,
         "hide_from_max_age": payload.hide_from_max_age if user.get("verified") else None,
@@ -1070,7 +1081,7 @@ def update_profile(payload: ProfileUpdatePayload, user: dict = Depends(get_curre
         "pref_max_distance", "pref_health_status", "pref_sexual_orientation",
         "hide_from_min_age", "hide_from_max_age", "hide_from_health_statuses",
         "visible_to", "lock_all_images",
-        "phone_number",   # ← ADD THIS LINE
+        "phone_number",
     ]
     for field in all_fields:
         value = getattr(payload, field, None)
@@ -1211,11 +1222,9 @@ def get_discover_profiles(
         p["last_active"] = status.get("last_active")
         filtered.append(p)
 
-    # --- Force all images visible for free users ---
     for p in filtered:
         p["lock_all_images"] = False
 
-    # Sort: most recently active first, distance as tie-breaker
     filtered.sort(key=lambda x: x.get("distance_km") or float('inf'))
     filtered.sort(key=lambda x: x.get("last_active") or "", reverse=True)
 
@@ -1224,7 +1233,6 @@ def get_discover_profiles(
         end = start + limit
         filtered = filtered[start:end]
 
-    # Conditionally charge tokens only for web clients
     if not is_premium(user) and is_web_client(request):
         require_token(user, len(filtered))
 
@@ -1232,7 +1240,6 @@ def get_discover_profiles(
 
 @api_router.post("/discover/swipe")
 def swipe_profile(payload: SwipePayload, request: Request, user: dict = Depends(get_current_user)):
-    # Conditionally charge tokens only for web clients
     if not is_premium(user) and is_web_client(request):
         require_token(user, 1)
     
@@ -1613,7 +1620,6 @@ def build_comment_tree(comments):
 # ---------- Random Chat ----------
 @api_router.post("/chat/start")
 def chat_start(request: Request, user: dict = Depends(get_current_user)):
-    # Conditionally charge tokens only for web clients
     if not is_premium(user) and is_web_client(request):
         require_token(user, 1)
     return {"ok": True}
@@ -1894,7 +1900,6 @@ def send_group_message(group_id: str, payload: dict, user: dict = Depends(get_cu
     
     sb.table("group_messages").insert(insert_data).execute()
     
-    # Get sender's display_name
     profile = _maybe(sb.table("user_profiles").select("display_name").eq("user_id", user["user_id"]).maybe_single().execute())
     
     response = {
@@ -1912,7 +1917,6 @@ def send_group_message(group_id: str, payload: dict, user: dict = Depends(get_cu
     
     return response
 
-
 @api_router.get("/groups/{group_id}/messages")
 def get_group_messages(group_id: str, limit: int = 50, before: Optional[str] = None, user: dict = Depends(get_current_user)):
     member = _maybe(sb.table("group_members").select("role").eq("group_id", group_id).eq("user_id", user["user_id"]).maybe_single().execute())
@@ -1922,14 +1926,12 @@ def get_group_messages(group_id: str, limit: int = 50, before: Optional[str] = N
     msgs = query.execute().data or []
     msgs.reverse()
     
-    # Get sender display_names from user_profiles
     sender_ids = list({m["sender_id"] for m in msgs})
     sender_names = {}
     if sender_ids:
         profiles_data = sb.table("user_profiles").select("user_id,display_name").in_("user_id", sender_ids).execute().data or []
         sender_names = {p["user_id"]: p.get("display_name", "Unknown") for p in profiles_data}
     
-    # Build reply lookup
     reply_ids = [m.get("reply_to_id") for m in msgs if m.get("reply_to_id")]
     reply_map = {}
     if reply_ids:
@@ -1952,7 +1954,6 @@ def get_group_messages(group_id: str, limit: int = 50, before: Optional[str] = N
             msg["reply_to"] = reply_map[msg["reply_to_id"]]
     
     return msgs
-
 
 @api_router.delete("/groups/{group_id}/messages/{message_id}")
 def delete_group_message(group_id: str, message_id: str, user: dict = Depends(get_current_user)):
@@ -2055,7 +2056,6 @@ def get_group_comments(group_id: str, message_id: str, user: dict = Depends(get_
     user_ids = list({c["user_id"] for c in comments})
     author_names = {}
     if user_ids:
-        # Use display_name from user_profiles
         profiles_data = sb.table("user_profiles").select("user_id,display_name").in_("user_id", user_ids).execute().data or []
         author_names = {p["user_id"]: p.get("display_name", "Unknown") for p in profiles_data}
     for c in comments:
@@ -2074,6 +2074,7 @@ def delete_group_comment(group_id: str, message_id: str, comment_id: str, user: 
             raise HTTPException(403)
     sb.table("group_message_comments").delete().eq("comment_id", comment_id).execute()
     return {"ok": True}
+
 # ==================== EMAIL / PASSWORD AUTH ====================
 def send_email(to_email: str, subject: str, html_body: str, text_body: str = ""):
     brevo_api_key = os.environ.get("BREVO_API_KEY")
@@ -2085,7 +2086,7 @@ def send_email(to_email: str, subject: str, html_body: str, text_body: str = "")
         "to": [{"email": to_email}],
         "subject": subject,
         "htmlContent": html_body,
-        "textContent": text_body,   # ← ADD PLAIN TEXT
+        "textContent": text_body,
     }
     try:
         resp = httpx.post(
@@ -2101,120 +2102,114 @@ def send_email(to_email: str, subject: str, html_body: str, text_body: str = "")
 
 @api_router.post("/auth/signup")
 def signup_email(payload: dict, request: Request, response: Response):
-    email = payload.get("email", "").strip().lower()
-    password = payload.get("password", "")
-    name = payload.get("name", email.split("@")[0])
-    if not email or not password:
-        raise HTTPException(400, "Email and password required")
-    if len(password) < 6:
-        raise HTTPException(400, "Password must be at least 6 characters")
-    existing = _maybe(sb.table("users").select("user_id,deleted").eq("email", email).maybe_single().execute())
-    if existing:
-        if existing.get("deleted"):
-            raise HTTPException(400, "An account with this email was deleted. Contact support.")
-        raise HTTPException(400, "An account with this email already exists")
-    raw_password = password[:72].encode("utf-8")
-    password_hash = bcrypt.hashpw(raw_password, bcrypt.gensalt()).decode()
-    user_id = f"user_{uuid.uuid4().hex[:12]}"
-    now = datetime.now(timezone.utc).isoformat()
-    verification_token = uuid.uuid4().hex
-    verification_expires = (datetime.now(timezone.utc) + timedelta(hours=24)).isoformat()
-    session_token = secrets.token_hex(32)
-    sb.table("users").insert({
-        "user_id": user_id, "email": email, "name": name,
-        "password_hash": password_hash, "email_verified": False,
-        "verification_token": verification_token,
-        "verification_token_expires": verification_expires,
-        "created_at": now, "last_active": now,
-        "tokens": 45, "diamonds": 5, "verified": False,
-    }).execute()
-    verify_link = f"https://havenpositive.online/verify-email?token={verification_token}"
-    body = f"""<h2>Welcome to Haven!</h2><p>Please verify your email by clicking the link below:</p><a href="{verify_link}">{verify_link}</a><p>This link expires in 24 hours.</p>"""
-    logger.info("VERIFICATION LINK: " + verify_link)
-    def send_verification():
-        try: send_email(email, "Verify your Haven account", body)
-        except Exception as e: logger.error(f"Failed to send verification email: {e}")
-    threading.Thread(target=send_verification).start()
-    return {"ok": True, "message": "Account created! Please check your email to verify."}
+    if not EMAIL_AUTH_ENABLED:
+        raise HTTPException(403, "Email sign-up is unavailable. Please sign in with Google.")
+    # ... existing signup code ...
 
 @api_router.post("/auth/login")
 def login_email(payload: dict, request: Request, response: Response):
-    email = payload.get("email", "").strip().lower()
-    password = payload.get("password", "")
-    if not email or not password:
-        raise HTTPException(400, "Email and password required")
-    user = _maybe(sb.table("users").select("*").eq("email", email).eq("deleted", False).maybe_single().execute())
-    if not user or not user.get("password_hash"):
-        raise HTTPException(401, "Invalid email or password")
-    try:
-        if not bcrypt.checkpw(password[:72].encode("utf-8"), user["password_hash"].encode()):
-            raise HTTPException(401, "Invalid email or password")
-    except Exception:
-        raise HTTPException(401, "Invalid email or password")
-    if not user.get("email_verified"):
-        raise HTTPException(403, "Please verify your email before logging in.")
-    session_token = secrets.token_hex(32)
-    expires_at = datetime.now(timezone.utc) + timedelta(days=7)
-    sb.table("user_sessions").upsert({
-        "session_token": session_token, "user_id": user["user_id"],
-        "expires_at": expires_at.isoformat(), "created_at": datetime.now(timezone.utc).isoformat()
-    }).execute()
-    sb.table("users").update({"last_active": datetime.now(timezone.utc).isoformat()}).eq("user_id", user["user_id"]).execute()
-    response.set_cookie(key="session_token", value=session_token, httponly=True, secure=request.url.scheme == "https", samesite="lax", path="/", max_age=7*24*60*60)
-    return {"ok": True, "user_id": user["user_id"], "token": session_token}
+    if not EMAIL_AUTH_ENABLED:
+        raise HTTPException(403, "Email login is unavailable. Please use Google to sign in.")
+    # ... existing login code ...
 
 @api_router.post("/auth/verify-email")
 def verify_email(payload: dict):
-    token = payload.get("token", "")
-    if not token: raise HTTPException(400, "Missing verification token")
-    user = _maybe(sb.table("users").select("*").eq("verification_token", token).maybe_single().execute())
-    if not user: raise HTTPException(400, "Invalid or expired token")
-    if user.get("email_verified"):
-        return {"ok": True, "message": "Email already verified"}
-    if _parse_dt(user["verification_token_expires"]) < datetime.now(timezone.utc):
-        raise HTTPException(400, "Verification token has expired.")
-    sb.table("users").update({
-        "email_verified": True, "verification_token": None, "verification_token_expires": None
-    }).eq("user_id", user["user_id"]).execute()
-    return {"ok": True, "message": "Email verified! You can now log in."}
+    if not EMAIL_AUTH_ENABLED:
+        raise HTTPException(403, "Email verification is not available. Please use Google to sign in.")
+    # ... existing verify code ...
 
 @api_router.post("/auth/forgot-password")
 def forgot_password(payload: dict):
-    email = payload.get("email", "").strip().lower()
-    if not email: raise HTTPException(400, "Email required")
-    user = _maybe(sb.table("users").select("*").eq("email", email).eq("deleted", False).maybe_single().execute())
-    if not user:
-        return {"ok": True, "message": "If that email is registered, you'll receive a password reset link."}
-    reset_token = uuid.uuid4().hex
-    reset_expires = (datetime.now(timezone.utc) + timedelta(hours=1)).isoformat()
-    sb.table("users").update({
-        "reset_token": reset_token, "reset_token_expires": reset_expires
-    }).eq("user_id", user["user_id"]).execute()
-    reset_link = f"https://havenpositive.online/reset-password?token={reset_token}"
-    body = f"""<h2>Password Reset</h2><p>Click the link below to reset your password:</p><a href="{reset_link}">{reset_link}</a><p>This link expires in 1 hour.</p>"""
-    logger.info("PASSWORD RESET LINK: " + reset_link)
-    def send_reset():
-        try: send_email(email, "Reset your Haven password", body)
-        except Exception as e: logger.error(f"Failed to send password reset email: {e}")
-    threading.Thread(target=send_reset).start()
-    return {"ok": True, "message": "If that email is registered, you'll receive a password reset link."}
+    if not EMAIL_AUTH_ENABLED:
+        raise HTTPException(400, "Password reset is unavailable. Please sign in with Google instead.")
+    # ... existing forgot password code ...
 
 @api_router.post("/auth/reset-password")
 def reset_password(payload: dict):
-    token = payload.get("token", "")
-    new_password = payload.get("password", "")
-    if not token or not new_password: raise HTTPException(400, "Token and new password required")
-    if len(new_password) < 6: raise HTTPException(400, "Password must be at least 6 characters")
-    user = _maybe(sb.table("users").select("*").eq("reset_token", token).maybe_single().execute())
-    if not user: raise HTTPException(400, "Invalid or expired token")
-    if _parse_dt(user["reset_token_expires"]) < datetime.now(timezone.utc):
-        raise HTTPException(400, "Reset token has expired")
-    raw_password = new_password[:72].encode("utf-8")
-    new_hash = bcrypt.hashpw(raw_password, bcrypt.gensalt()).decode()
-    sb.table("users").update({
-        "password_hash": new_hash, "reset_token": None, "reset_token_expires": None
-    }).eq("user_id", user["user_id"]).execute()
-    return {"ok": True, "message": "Password reset successfully."}
+    if not EMAIL_AUTH_ENABLED:
+        raise HTTPException(400, "Password reset is unavailable. Please sign in with Google instead.")
+    # ... existing reset password code ...
+
+# ==================== FEEDBACK & SUPPORT ====================
+@api_router.post("/feedback")
+def submit_feedback(payload: FeedbackPayload, user: dict = Depends(get_current_user)):
+    if payload.type not in ["suggestion", "complaint", "bug", "other"]:
+        raise HTTPException(400, "Invalid feedback type")
+    feedback_id = f"fb_{uuid.uuid4().hex[:12]}"
+    sb.table("feedback").insert({
+        "feedback_id": feedback_id,
+        "user_id": user["user_id"],
+        "type": payload.type,
+        "message": payload.message,
+    }).execute()
+    return {"ok": True, "feedback_id": feedback_id}
+
+@api_router.post("/support/tickets")
+def create_support_ticket(payload: SupportTicketCreatePayload, user: dict = Depends(get_current_user)):
+    ticket_id = f"ticket_{uuid.uuid4().hex[:12]}"
+    now = datetime.now(timezone.utc).isoformat()
+    sb.table("support_tickets").insert({
+        "ticket_id": ticket_id,
+        "user_id": user["user_id"],
+        "subject": payload.subject,
+        "status": "open",
+        "created_at": now,
+        "updated_at": now
+    }).execute()
+    message_id = f"supmsg_{uuid.uuid4().hex[:12]}"
+    sb.table("support_messages").insert({
+        "message_id": message_id,
+        "ticket_id": ticket_id,
+        "sender_id": user["user_id"],
+        "content": payload.message,
+        "created_at": now,
+        "read": False
+    }).execute()
+    return {"ok": True, "ticket_id": ticket_id}
+
+@api_router.get("/support/tickets")
+def get_my_support_tickets(user: dict = Depends(get_current_user)):
+    tickets = sb.table("support_tickets").select("*").eq("user_id", user["user_id"]).order("updated_at", desc=True).execute().data or []
+    return tickets
+
+@api_router.get("/support/tickets/{ticket_id}/messages")
+def get_support_messages(ticket_id: str, user: dict = Depends(get_current_user)):
+    ticket = _maybe(sb.table("support_tickets").select("*").eq("ticket_id", ticket_id).maybe_single().execute())
+    if not ticket:
+        raise HTTPException(404, "Ticket not found")
+    if ticket["user_id"] != user["user_id"] and not user.get("is_admin"):
+        raise HTTPException(403, "Access denied")
+    msgs = sb.table("support_messages").select("*").eq("ticket_id", ticket_id).order("created_at").execute().data or []
+    return msgs
+
+@api_router.post("/support/tickets/{ticket_id}/messages")
+def send_support_message(ticket_id: str, payload: SupportMessagePayload, user: dict = Depends(get_current_user)):
+    ticket = _maybe(sb.table("support_tickets").select("*").eq("ticket_id", ticket_id).maybe_single().execute())
+    if not ticket:
+        raise HTTPException(404, "Ticket not found")
+    if ticket["status"] == "closed":
+        raise HTTPException(400, "Ticket is closed")
+    if ticket["user_id"] != user["user_id"] and not user.get("is_admin"):
+        raise HTTPException(403)
+    message_id = f"supmsg_{uuid.uuid4().hex[:12]}"
+    now = datetime.now(timezone.utc).isoformat()
+    sb.table("support_messages").insert({
+        "message_id": message_id,
+        "ticket_id": ticket_id,
+        "sender_id": user["user_id"],
+        "content": payload.content,
+        "created_at": now,
+        "read": False
+    }).execute()
+    sb.table("support_tickets").update({"updated_at": now}).eq("ticket_id", ticket_id).execute()
+    return {"ok": True, "message_id": message_id}
+
+@api_router.put("/support/tickets/{ticket_id}/close")
+def close_support_ticket(ticket_id: str, user: dict = Depends(get_current_user)):
+    if not user.get("is_admin"):
+        raise HTTPException(403)
+    sb.table("support_tickets").update({"status": "closed", "updated_at": datetime.now(timezone.utc).isoformat()}).eq("ticket_id", ticket_id).execute()
+    return {"ok": True}
 
 # ==================== ADMIN ====================
 @api_router.get("/admin/check")
@@ -2505,10 +2500,26 @@ def get_user_profile(user_id: str):
     if not profile: raise HTTPException(404, "User not found")
     return profile
 
-# ==================== PUBLIC CHATS ====================
+# ==================== ADMIN: FEEDBACK & SUPPORT ====================
+@api_router.get("/admin/feedback")
+def admin_get_feedback(user: dict = Depends(get_current_user)):
+    if not user.get("is_admin"):
+        raise HTTPException(403)
+    feedbacks = sb.table("feedback").select("*").order("created_at", desc=True).execute().data or []
+    return feedbacks
 
+@api_router.get("/admin/support/tickets")
+def admin_get_support_tickets(status: Optional[str] = None, user: dict = Depends(get_current_user)):
+    if not user.get("is_admin"):
+        raise HTTPException(403)
+    query = sb.table("support_tickets").select("*").order("updated_at", desc=True)
+    if status:
+        query = query.eq("status", status)
+    tickets = query.execute().data or []
+    return tickets
+
+# ==================== PUBLIC CHATS ====================
 def ensure_public_chats():
-    """Create HIV, HSV, HPV public chats if they don't exist."""
     for chat_type in ["HIV", "HSV", "HPV"]:
         existing = _maybe(sb.table("public_chats").select("chat_id").eq("chat_type", chat_type).maybe_single().execute())
         if not existing:
@@ -2636,11 +2647,7 @@ def delete_public_chat_message(message_id: str, user: dict = Depends(get_current
     sb.table("public_chat_messages").delete().eq("message_id", message_id).execute()
     return {"ok": True}
 
-
 # ==================== WHATSAPP (TWILIO) ====================
-
-# ==================== WHATSAPP (TWILIO) ====================
-
 import os
 from twilio.rest import Client as TwilioClient
 
@@ -2648,22 +2655,16 @@ TWILIO_ACCOUNT_SID = os.environ.get("TWILIO_ACCOUNT_SID")
 TWILIO_AUTH_TOKEN = os.environ.get("TWILIO_AUTH_TOKEN")
 TWILIO_WHATSAPP_NUMBER = os.environ.get("TWILIO_WHATSAPP_NUMBER", "whatsapp:+14155238886")
 
-
 def send_whatsapp_message(to_phone: str, sender_name: str, message: str):
-    """Send a WhatsApp message via Twilio."""
     if not TWILIO_ACCOUNT_SID or not TWILIO_AUTH_TOKEN:
         raise HTTPException(500, "WhatsApp service not configured")
     
     client = TwilioClient(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
     
-    # Remove any existing whatsapp: prefix, then add it fresh
     if to_phone.startswith("whatsapp:"):
-        to_phone = to_phone[9:]  # Remove "whatsapp:"
+        to_phone = to_phone[9:]
     
-    # Clean the number (remove spaces, etc.)
     to_phone = to_phone.strip().replace(" ", "")
-    
-    # Add the whatsapp: prefix
     to_whatsapp = f"whatsapp:{to_phone}"
     
     logger.info(f"Sending WhatsApp from {TWILIO_WHATSAPP_NUMBER} to {to_whatsapp}")
@@ -2675,11 +2676,9 @@ def send_whatsapp_message(to_phone: str, sender_name: str, message: str):
     )
     return msg.sid
 
-
 class WhatsAppPayload(BaseModel):
     user_id: str
     message: str
-
 
 @api_router.post("/whatsapp/send")
 def send_whatsapp(payload: WhatsAppPayload, user: dict = Depends(get_current_user)):
@@ -2712,7 +2711,6 @@ def send_whatsapp(payload: WhatsAppPayload, user: dict = Depends(get_current_use
     notify_user(payload.user_id, "whatsapp_message", f"{sender_name} sent you a WhatsApp message", user["user_id"])
     
     return {"ok": True, "message": "WhatsApp message sent!"}
-
 
 @api_router.get("/whatsapp/contacts")
 def get_whatsapp_contacts(user: dict = Depends(get_current_user)):
@@ -2761,15 +2759,13 @@ def get_whatsapp_contacts(user: dict = Depends(get_current_user)):
     return result
 
 # ==================== EMAIL MESSAGING ====================
-
 class EmailPayload(BaseModel):
     user_id: str
     subject: str
     message: str
+
 @api_router.post("/email/send")
 def send_email_message(payload: EmailPayload, user: dict = Depends(get_current_user)):
-    """Send an email to a matched user. Free for all verified users."""
-    
     if not user.get("verified"):
         raise HTTPException(400, "Only verified users can send email messages")
     
@@ -2788,7 +2784,6 @@ def send_email_message(payload: EmailPayload, user: dict = Depends(get_current_u
     subject = payload.subject or f"You have a message from {sender_name} on Haven"
     
     try:
-        # Plain text version
         plain_text = f"""
 Hi,
 
@@ -2802,7 +2797,6 @@ Hi,
 This message was sent from your Haven match. You can adjust notification settings in the app.
         """
         
-        # HTML version
         email_body = f"""
         <html>
         <head><title>{subject}</title></head>
@@ -2861,12 +2855,9 @@ This message was sent from your Haven match. You can adjust notification setting
     
     return {"ok": True, "message": "Email sent!"}
 
-
 # ==================== MOUNT ROUTER ====================
 app.include_router(api_router)
 
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=int(os.environ.get("PORT", 8000)))
-    
-
