@@ -1282,10 +1282,12 @@ def get_discover_profiles(
 
     for p in filtered:
         p["lock_all_images"] = False
-
-    filtered.sort(key=lambda x: x.get("distance_km") or float('inf'))
-    filtered.sort(key=lambda x: x.get("last_active") or "", reverse=True)
-
+      # Sort: profiles with a profile image first, then by last active, then by distance
+        #filtered.sort(key=lambda x: (0 if (x.get('profile_image') or '').strip() else 1, x.get('last_active') or '', x.get('distance_km') or float('inf')))
+        filtered.sort(key=lambda x: x.get("distance_km") or float('inf'))
+        filtered.sort(key=lambda x: x.get("last_active") or "", reverse=True)
+        filtered.sort(key=lambda x: 0 if (x.get('profile_image') or '').strip() else 1)
+       
     if page is not None and limit is not None:
         start = (page - 1) * limit
         end = start + limit
@@ -2958,4 +2960,11 @@ app.include_router(api_router)
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=int(os.environ.get("PORT", 8000)))
+    uvicorn.run(app, host="0.0.0.0", port=int(os.environ.get("PORT", 8000)))    
+     
+   # Sort: profiles with a profile image first, then by last active, then by distance
+filtered.sort(key=lambda x: (
+    0 if x.get('profile_image') and x['profile_image'].strip() else 1,   # images first
+    x.get('last_active') or '',                                          # most recent active
+    x.get('distance_km') or float('inf')                                 # closest distance
+), reverse=False)  
