@@ -2920,9 +2920,9 @@ This message was sent from your Haven match. You can adjust notification setting
 
 # ==================== INVITE / REFERRAL ====================
 def generate_invite_code() -> str:
-    """Generate a unique 8‑character alphanumeric invite code."""
+    """Generate a unique 7‑character alphanumeric invite code."""
     while True:
-        code = ''.join(random.choices(string.ascii_uppercase + string.digits, k=8))
+        code = ''.join(random.choices(string.ascii_uppercase + string.digits, k=7))   # ← changed from 8 to 7
         exists = _maybe(sb.table("users").select("user_id").eq("invite_code", code).maybe_single().execute())
         if not exists:
             return code
