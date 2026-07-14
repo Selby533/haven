@@ -2962,9 +2962,4 @@ if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=int(os.environ.get("PORT", 8000)))    
      
-   # Sort: profiles with a profile image first, then by last active, then by distance
-filtered.sort(key=lambda x: (
-    0 if x.get('profile_image') and x['profile_image'].strip() else 1,   # images first
-    x.get('last_active') or '',                                          # most recent active
-    x.get('distance_km') or float('inf')                                 # closest distance
-), reverse=False)  
+
