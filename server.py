@@ -9,6 +9,7 @@ from pydantic import BaseModel, validator
 from typing import Optional, List, Dict
 from datetime import datetime, timezone, timedelta
 from PIL import Image
+import string
 
 # ---------- Enable HEIC/HEIF support for Pillow ----------
 try:
@@ -195,6 +196,20 @@ def increment_diamonds(user_id: str, amount: int) -> int:
         logger.error(f"increment_diamonds failed: {e}")
         raise HTTPException(500, "Diamond update error")
 
+def increment_tokens(user_id: str, amount: int):
+    """Atomically add tokens (used for referral rewards)."""
+    try:
+        result = sb.rpc('increment_tokens', {'uid': user_id, 'amt': amount}).execute()
+        if not result.data:
+            # Fallback manual update
+            current = sb.table("users").select("tokens").eq("user_id", user_id).single().execute().data["tokens"]
+            sb.table("users").update({"tokens": current + amount}).eq("user_id", user_id).execute()
+    except Exception as e:
+        logger.error(f"increment_tokens failed: {e}")
+        # Fallback
+        current = sb.table("users").select("tokens").eq("user_id", user_id).single().execute().data["tokens"]
+        sb.table("users").update({"tokens": current + amount}).eq("user_id", user_id).execute()
+
 async def reverse_geocode(lat: float, lon: float) -> tuple:
     try:
         client = get_async_client()
@@ -324,7 +339,7 @@ class ProfileSetupPayload(BaseModel):
     pref_max_age: Optional[int] = 99; pref_country: Optional[str] = ""
     pref_max_distance: Optional[int] = 15000; pref_health_status: Optional[str] = ""
     pref_sexual_orientation: Optional[str] = ""
-    phone_number: Optional[str] = ""   # ← MUST have = ""
+    phone_number: Optional[str] = ""
     profile_hidden: Optional[bool] = False
     hide_from_min_age: Optional[int] = None; hide_from_max_age: Optional[int] = None
     hide_from_health_statuses: Optional[str] = ""
@@ -346,6 +361,7 @@ class ProfileSetupPayload(BaseModel):
             raise
         except Exception:
             raise ValueError(f"Invalid date format: {v}")
+
 class ProfileUpdatePayload(BaseModel):
     date_of_birth: Optional[str] = None; gender: Optional[str] = None; health_status: Optional[str] = None
     sexual_orientation: Optional[str] = None
@@ -412,6 +428,14 @@ class SupportTicketCreatePayload(BaseModel):
 
 class SupportMessagePayload(BaseModel):
     content: str
+
+# ---------- Invite / Referral Models ----------
+class InviteResponse(BaseModel):
+    invite_code: str
+    invite_url: str
+    invited_count: int
+    tokens_earned: int
+    diamonds_earned: int
 
 # ---------- Auth dependency ----------
 def get_current_user(
@@ -483,9 +507,11 @@ def api_root():
 def auth_google(payload: GoogleAuthPayload, request: Request, response: Response):
     check_rate_limit(f"auth_{request.client.host}", max_req=5)
     email, name, picture = payload.email, payload.name, payload.picture
+    ref_code = payload.ref   # referral code if provided
     session_token = secrets.token_hex(32)
     existing = _maybe(sb.table("users").select("*").eq("email", email).eq("deleted", False).maybe_single().execute())
     now_iso = datetime.now(timezone.utc).isoformat()
+
     if existing:
         user_id = existing["user_id"]
         sb.table("users").update({"name": name, "picture": picture, "last_active": now_iso, "deleted": False}).eq("user_id", user_id).execute()
@@ -497,12 +523,36 @@ def auth_google(payload: GoogleAuthPayload, request: Request, response: Response
             user_id = deleted_user["user_id"]
             sb.table("users").update({"name": name, "picture": picture, "last_active": now_iso, "deleted": False}).eq("user_id", user_id).execute()
         else:
+            # --- NEW USER CREATION ---
             user_id = f"user_{uuid.uuid4().hex[:12]}"
+            invite_code = generate_invite_code()
             sb.table("users").insert({
                 "user_id": user_id, "email": email, "name": name, "picture": picture,
                 "created_at": now_iso, "last_active": now_iso,
-                "tokens": 40, "diamonds": 5, "verified": False
+                "tokens": 40, "diamonds": 5, "verified": False,
+                "invite_code": invite_code
             }).execute()
+
+            # --- Referral Processing ---
+            if ref_code:
+                inviter = _maybe(sb.table("users").select("user_id").eq("invite_code", ref_code).maybe_single().execute())
+                if inviter and inviter["user_id"] != user_id:
+                    already_referred = _maybe(sb.table("referrals").select("id").eq("invited_user_id", user_id).maybe_single().execute())
+                    if not already_referred:
+                        # Give rewards
+                        increment_tokens(inviter["user_id"], 50)
+                        increment_diamonds(inviter["user_id"], 1)
+                        increment_tokens(user_id, 50)
+
+                        sb.table("referrals").insert({
+                            "inviter_id": inviter["user_id"],
+                            "invited_user_id": user_id,
+                            "invited_at": now_iso
+                        }).execute()
+
+                        notify_user(inviter["user_id"], "referral", "Someone used your invite code! +50 tokens, +1 diamond.", user_id)
+                        notify_user(user_id, "referral", "You used an invite code! +50 tokens bonus.", inviter["user_id"])
+
     expires_at = datetime.now(timezone.utc) + timedelta(days=7)
     sb.table("user_sessions").upsert({"session_token": session_token, "user_id": user_id, "expires_at": expires_at.isoformat(), "created_at": now_iso}).execute()
     response.set_cookie(key="session_token", value=session_token, httponly=True, secure=request.url.scheme == "https", samesite="lax", path="/", max_age=7*24*60*60)
@@ -600,6 +650,15 @@ def purchase_premium(tier: str = "gold", user: dict = Depends(get_current_user))
         "premium_tier": tier,
         "premium_expires_at": expires.isoformat()
     }).eq("user_id", user["user_id"]).execute()
+
+    # ---------- Referral bonus ----------
+    referral = _maybe(sb.table("referrals").select("id,inviter_id,premium_reward_claimed").eq("invited_user_id", user["user_id"]).maybe_single().execute())
+    if referral and not referral.get("premium_reward_claimed"):
+        inviter_id = referral["inviter_id"]
+        increment_diamonds(inviter_id, 5)
+        sb.table("referrals").update({"premium_reward_claimed": True}).eq("id", referral["id"]).execute()
+        notify_user(inviter_id, "referral_premium", "Your referral bought premium! +5 diamonds.", user["user_id"])
+
     return {"ok": True, "premium_tier": tier, "diamonds": new_diamonds, "expires_at": expires.isoformat()}
 
 @api_router.put("/premium/auto-renew")
@@ -891,7 +950,7 @@ def get_profile(user: dict) -> dict:
             "location_source": "none",
             "last_active": user.get("last_active"),
             "verified": False, "premium_tier": None,
-            "phone_number": "",   # ← ADD THIS LINE
+            "phone_number": "",
             "visible_to": "all", "pref_sexual_orientation": "", "lock_all_images": False
         }
     lat = profile.get("gps_latitude"); lon = profile.get("gps_longitude")
@@ -926,10 +985,9 @@ def get_profile(user: dict) -> dict:
         "hide_from_min_age": profile.get("hide_from_min_age"),
         "hide_from_max_age": profile.get("hide_from_max_age"),
         "hide_from_health_statuses": profile.get("hide_from_health_statuses",""),
-        "phone_number": profile.get("phone_number", ""),   # ← ADD THIS LINE
+        "phone_number": profile.get("phone_number", ""),
         "visible_to": profile.get("visible_to", "all"),
-        "lock_all_images": False,   # force all images visible
-        #"lock_all_images": profile.get("lock_all_images", False),
+        "lock_all_images": False,
         "gps_latitude": lat, "gps_longitude": lon,
         "gps_verified_at": profile.get("gps_verified_at"),
         "location_source": profile.get("location_source", "none"),
@@ -2105,30 +2163,35 @@ def signup_email(payload: dict, request: Request, response: Response):
     if not EMAIL_AUTH_ENABLED:
         raise HTTPException(403, "Email sign-up is unavailable. Please sign in with Google.")
     # ... existing signup code ...
+    return {"ok": True}
 
 @api_router.post("/auth/login")
 def login_email(payload: dict, request: Request, response: Response):
     if not EMAIL_AUTH_ENABLED:
         raise HTTPException(403, "Email login is unavailable. Please use Google to sign in.")
     # ... existing login code ...
+    return {"ok": True}
 
 @api_router.post("/auth/verify-email")
 def verify_email(payload: dict):
     if not EMAIL_AUTH_ENABLED:
         raise HTTPException(403, "Email verification is not available. Please use Google to sign in.")
     # ... existing verify code ...
+    return {"ok": True}
 
 @api_router.post("/auth/forgot-password")
 def forgot_password(payload: dict):
     if not EMAIL_AUTH_ENABLED:
         raise HTTPException(400, "Password reset is unavailable. Please sign in with Google instead.")
     # ... existing forgot password code ...
+    return {"ok": True}
 
 @api_router.post("/auth/reset-password")
 def reset_password(payload: dict):
     if not EMAIL_AUTH_ENABLED:
         raise HTTPException(400, "Password reset is unavailable. Please sign in with Google instead.")
     # ... existing reset password code ...
+    return {"ok": True}
 
 # ==================== FEEDBACK & SUPPORT ====================
 @api_router.post("/feedback")
@@ -2854,6 +2917,41 @@ This message was sent from your Haven match. You can adjust notification setting
     )
     
     return {"ok": True, "message": "Email sent!"}
+
+# ==================== INVITE / REFERRAL ====================
+def generate_invite_code() -> str:
+    """Generate a unique 8‑character alphanumeric invite code."""
+    while True:
+        code = ''.join(random.choices(string.ascii_uppercase + string.digits, k=8))
+        exists = _maybe(sb.table("users").select("user_id").eq("invite_code", code).maybe_single().execute())
+        if not exists:
+            return code
+
+def get_or_create_invite_code(user_id: str) -> str:
+    """Return user's invite code, generating one if it doesn't exist."""
+    user = _maybe(sb.table("users").select("invite_code").eq("user_id", user_id).maybe_single().execute())
+    if user and user.get("invite_code"):
+        return user["invite_code"]
+    code = generate_invite_code()
+    sb.table("users").update({"invite_code": code}).eq("user_id", user_id).execute()
+    return code
+
+@api_router.get("/invite", response_model=InviteResponse)
+def get_invite_status(user: dict = Depends(get_current_user)):
+    code = get_or_create_invite_code(user["user_id"])
+    invite_url = f"https://havenpositive.online/?ref={code}"
+    referrals = sb.table("referrals").select("id,premium_reward_claimed").eq("inviter_id", user["user_id"]).execute().data or []
+    invited_count = len(referrals)
+    tokens_earned = invited_count * 50   # each invite gives 50 tokens to inviter
+    diamonds_earned = invited_count * 1  # base 1 diamond per invite
+    diamonds_earned += sum(1 for r in referrals if r.get("premium_reward_claimed")) * 5
+    return {
+        "invite_code": code,
+        "invite_url": invite_url,
+        "invited_count": invited_count,
+        "tokens_earned": tokens_earned,
+        "diamonds_earned": diamonds_earned,
+    }
 
 # ==================== MOUNT ROUTER ====================
 app.include_router(api_router)
