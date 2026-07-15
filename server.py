@@ -1286,7 +1286,7 @@ def get_discover_profiles(
         #filtered.sort(key=lambda x: (0 if (x.get('profile_image') or '').strip() else 1, x.get('last_active') or '', x.get('distance_km') or float('inf')))
         filtered.sort(key=lambda x: x.get("distance_km") or float('inf'))
         filtered.sort(key=lambda x: x.get("last_active") or "", reverse=True)
-        filtered.sort(key=lambda x: 0 if (x.get('profile_image') or '').strip() else 1)
+        #filtered.sort(key=lambda x: 0 if (x.get('profile_image') or '').strip() else 1)
        
     if page is not None and limit is not None:
         start = (page - 1) * limit
