@@ -766,10 +766,7 @@ async def capture_diamond_order(order_id: str, package_id: str, user: dict = Dep
     new_diamonds = increment_diamonds(user["user_id"], diamonds)
     return {"ok": True, "diamonds": new_diamonds}
 
-
-
-
-
+# ---- FIXED Google Play purchase verification ----
 @api_router.post("/purchase/google-play")
 def verify_google_purchase(payload: dict, user: dict = Depends(get_current_user)):
     product_id = payload.get("product_id")
@@ -777,7 +774,7 @@ def verify_google_purchase(payload: dict, user: dict = Depends(get_current_user)
     if not product_id or not purchase_token:
         raise HTTPException(400, "Missing product_id or purchase_token")
 
-    # Check if purchase already processed – using standard list response
+    # Check if purchase already processed (using standard list response)
     already_res = sb.table("diamond_purchases") \
         .select("purchase_id") \
         .eq("google_purchase_token", purchase_token) \
@@ -796,39 +793,59 @@ def verify_google_purchase(payload: dict, user: dict = Depends(get_current_user)
             raise HTTPException(500, "Service account not configured")
         from google.oauth2 import service_account
         from googleapiclient.discovery import build
+        from googleapiclient.errors import HttpError
+
         credentials = service_account.Credentials.from_service_account_info(
             json.loads(creds_json),
             scopes=["https://www.googleapis.com/auth/androidpublisher"],
         )
         service = build("androidpublisher", "v3", credentials=credentials)
-        result = service.purchases().products().get(
+
+        # Verify the purchase
+        purchase = service.purchases().products().get(
             packageName="date.perfecthorse.havenpositive",
             productId=product_id,
             token=purchase_token,
         ).execute()
-        if result.get("purchaseState") == 0:
+
+        purchase_state = purchase.get("purchaseState")
+        if purchase_state != 0:
+            raise HTTPException(400, f"Purchase not valid (state: {purchase_state})")
+
+        # Try to acknowledge the purchase (consume it)
+        try:
             service.purchases().products().acknowledge(
                 packageName="date.perfecthorse.havenpositive",
                 productId=product_id,
                 token=purchase_token,
                 body={}
             ).execute()
-            sb.table("diamond_purchases").insert({
-                "purchase_id": f"diam_{uuid.uuid4().hex[:12]}",
-                "user_id": user["user_id"],
-                "item": f"{diamonds}_diamonds_google",
-                "diamond_cost": 0,
-                "purchased_at": datetime.now(timezone.utc).isoformat(),
-                "google_purchase_token": purchase_token
-            }).execute()
-            new_diamonds = increment_diamonds(user["user_id"], diamonds)
-            return {"ok": True, "diamonds": new_diamonds}
-        else:
-            raise HTTPException(400, "Purchase not valid or already consumed")
+        except HttpError as ack_err:
+            # If already acknowledged, we can still credit the diamonds
+            if "invalidPurchaseState" in str(ack_err):
+                logger.warning(f"Acknowledge failed (already consumed?): {ack_err}")
+            else:
+                raise  # unexpected error
+
+        # Record the purchase and credit diamonds
+        sb.table("diamond_purchases").insert({
+            "purchase_id": f"diam_{uuid.uuid4().hex[:12]}",
+            "user_id": user["user_id"],
+            "item": f"{diamonds}_diamonds_google",
+            "diamond_cost": 0,
+            "purchased_at": datetime.now(timezone.utc).isoformat(),
+            "google_purchase_token": purchase_token
+        }).execute()
+
+        new_diamonds = increment_diamonds(user["user_id"], diamonds)
+        return {"ok": True, "diamonds": new_diamonds}
+
+    except HttpError as e:
+        logger.exception("Google Play verification HTTP error")
+        raise HTTPException(400, f"Purchase verification failed: {e}")
     except Exception as e:
         logger.exception("Google Play verification failed")
         raise HTTPException(400, f"Purchase verification failed: {str(e)}")
-
 
 
 @api_router.post("/earn-tokens")
@@ -2973,5 +2990,4 @@ app.include_router(api_router)
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=int(os.environ.get("PORT", 8000)))    
-     
+    uvicorn.run(app, host="0.0.0.0", port=int(os.environ.get("PORT", 8000)))
