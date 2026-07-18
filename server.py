@@ -766,19 +766,30 @@ async def capture_diamond_order(order_id: str, package_id: str, user: dict = Dep
     new_diamonds = increment_diamonds(user["user_id"], diamonds)
     return {"ok": True, "diamonds": new_diamonds}
 
+
+
+
+
 @api_router.post("/purchase/google-play")
 def verify_google_purchase(payload: dict, user: dict = Depends(get_current_user)):
     product_id = payload.get("product_id")
     purchase_token = payload.get("purchase_token")
     if not product_id or not purchase_token:
         raise HTTPException(400, "Missing product_id or purchase_token")
-    already = sb.table("diamond_purchases").select("purchase_id").eq("google_purchase_token", purchase_token).maybe_single().execute()
-    if already.data:
+
+    # Check if purchase already processed – using standard list response
+    already_res = sb.table("diamond_purchases") \
+        .select("purchase_id") \
+        .eq("google_purchase_token", purchase_token) \
+        .execute()
+    if already_res.data and len(already_res.data) > 0:
         raise HTTPException(409, "Purchase already processed")
+
     diamond_map = {"diamonds_52": 52, "diamonds_120": 120, "diamonds_310": 310, "diamonds_770": 770}
     diamonds = diamond_map.get(product_id)
     if not diamonds:
         raise HTTPException(400, "Invalid product_id")
+
     try:
         creds_json = os.environ.get("GOOGLE_SERVICE_ACCOUNT_JSON")
         if not creds_json:
@@ -817,6 +828,8 @@ def verify_google_purchase(payload: dict, user: dict = Depends(get_current_user)
     except Exception as e:
         logger.exception("Google Play verification failed")
         raise HTTPException(400, f"Purchase verification failed: {str(e)}")
+
+
 
 @api_router.post("/earn-tokens")
 def earn_tokens(user: dict = Depends(get_current_user)):
@@ -2962,4 +2975,3 @@ if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=int(os.environ.get("PORT", 8000)))    
      
-
