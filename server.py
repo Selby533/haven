@@ -1371,39 +1371,85 @@ def swipe_profile(payload: SwipePayload, request: Request, user: dict = Depends(
     return {"ok": True, "matched": matched, "match_id": match_id, "direction": payload.direction}
 
 # ---------- Matches / Messages ----------
+
+
+
+
+
 @api_router.get("/discover/matches")
 def get_matches(swipe_type: Optional[str] = 'dating', user: dict = Depends(get_current_user)):
-    matches = sb.table("profile_matches").select("*").or_(f"user1_id.eq.{user['user_id']},user2_id.eq.{user['user_id']}").eq("swipe_type", swipe_type).order("created_at", desc=True).execute()
+    matches = sb.table("profile_matches").select("*")\
+        .or_(f"user1_id.eq.{user['user_id']},user2_id.eq.{user['user_id']}")\
+        .eq("swipe_type", swipe_type)\
+        .order("created_at", desc=True).execute()
     if not matches.data:
         return []
+
     partner_ids = []
     for m in matches.data:
         partner_id = m["user2_id"] if m["user1_id"] == user["user_id"] else m["user1_id"]
         partner_ids.append(partner_id)
+
+    # Get profiles
     profiles = {}
     if partner_ids:
-        prof_data = sb.table("user_profiles").select("user_id,display_name,profile_image,bio,country,city,health_status").in_("user_id", list(set(partner_ids))).execute().data or []
+        prof_data = sb.table("user_profiles")\
+            .select("user_id,display_name,profile_image,bio,country,city,health_status")\
+            .in_("user_id", list(set(partner_ids))).execute().data or []
         profiles = {p["user_id"]: p for p in prof_data}
+
+    # Get users for last_active
+    users_data = sb.table("users").select("user_id,last_active")\
+        .in_("user_id", list(set(partner_ids))).execute().data or []
+    last_active_map = {u["user_id"]: u.get("last_active") for u in users_data}
+
     match_ids = [m["match_id"] for m in matches.data]
+
+    # Unread counts
     unread_map = {}
     if match_ids:
-        unread_res = sb.table("match_messages").select("match_id,read,sender_id").in_("match_id", match_ids).eq("read", False).neq("sender_id", user["user_id"]).execute().data or []
+        unread_res = sb.table("match_messages")\
+            .select("match_id,read,sender_id")\
+            .in_("match_id", match_ids)\
+            .eq("read", False)\
+            .neq("sender_id", user["user_id"]).execute().data or []
         for msg in unread_res:
             unread_map[msg["match_id"]] = unread_map.get(msg["match_id"], 0) + 1
+
+    # Latest message for each match
+    last_msg_map = {}
+    for m in matches.data:
+        last_msg = sb.table("match_messages")\
+            .select("content")\
+            .eq("match_id", m["match_id"])\
+            .order("created_at", desc=True)\
+            .limit(1)\
+            .execute().data
+        if last_msg:
+            last_msg_map[m["match_id"]] = last_msg[0]["content"]
+
     result = []
     for m in matches.data:
         partner_id = m["user2_id"] if m["user1_id"] == user["user_id"] else m["user1_id"]
         prof = profiles.get(partner_id, {})
         result.append({
-            "match_id": m["match_id"], "user_id": partner_id,
+            "match_id": m["match_id"],
+            "user_id": partner_id,
             "display_name": prof.get("display_name",""),
             "profile_image": prof.get("profile_image",""),
-            "bio": prof.get("bio",""), "country": prof.get("country",""), "city": prof.get("city",""),
+            "bio": prof.get("bio",""),
+            "country": prof.get("country",""),
+            "city": prof.get("city",""),
             "health_status": prof.get("health_status"),
             "created_at": m["created_at"],
             "unread_count": unread_map.get(m["match_id"], 0),
+            "last_message": last_msg_map.get(m["match_id"], ""),
+            "last_active": last_active_map.get(partner_id),
         })
     return result
+
+
+
 
 @api_router.get("/discover/matches/{match_id}/messages")
 def get_match_messages(match_id: str, user: dict = Depends(get_current_user)):
@@ -2990,4 +3036,7 @@ app.include_router(api_router)
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=int(os.environ.get("PORT", 8000)))
+    uvicorn.run(app, host="0.0.0.0", port=int(os.environ.get("PORT", 8000)))    
+    
+    
+    
